@@ -652,6 +652,8 @@ def result_card(report, width=98):
         add("Partial batch scores are provisional; unfinished work gets no credit.")
         if report.get("unmeasured_lanes"):
             add("Not measured: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
+    if report.get("context_error"):
+        add("Context setup: " + report["context_error"])
     add()
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
     show_api_errors = any(s.get("api_errors", 0) for _, s in summaries)
@@ -701,6 +703,9 @@ def result_card(report, width=98):
     calibration = report.get("calibration", {})
     if calibration.get("error"):
         add("Calibration: " + calibration["error"])
+    for lanes, summary in summaries:
+        if summary.get("context_limited_sessions"):
+            add(f"{lanes}L context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
@@ -749,7 +754,117 @@ class FillerClient:
         return self.client.complete(messages, stage, config)
 
 
-VERSION = "ripal-v6"
+class PhaseProgress:
+    def __init__(self, ui, phase, offset):
+        self.ui, self.phase, self.offset = ui, phase, offset
+
+    def lane(self, index, **changes):
+        for key in ("task", "finished"):
+            if key in changes:
+                changes[key] += self.offset
+        if self.phase == "warmup":
+            changes.pop("completed", None)
+            changes.pop("failures", None)
+            if "stage" in changes:
+                changes["stage"] = "warmup/" + changes["stage"]
+            if changes.get("status") == "completed":
+                changes["status"] = "warmup done"
+        self.ui.lane(index, **changes)
+
+    def request_done(self, index, seconds, tokens):
+        if self.phase == "warmup":
+            self.ui.log(f"Warmup lane {index + 1} response {seconds:.2f}s (unscored)")
+        else:
+            self.ui.request_done(index, seconds, tokens)
+
+    def log(self, *args, **kwargs):
+        self.ui.log(*args, **kwargs)
+
+    def difference(self, *args, **kwargs):
+        self.ui.difference(*args, **kwargs)
+
+
+class PhaseClient:
+    def __init__(self, client, phase, offset=0):
+        self.client = client
+        self.progress = PhaseProgress(client.progress, phase, offset) if getattr(client, "progress", None) else None
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+
+class ContextLimitReached(Exception):
+    pass
+
+
+class ContextBudget:
+    def __init__(self, client, tools, output_tokens, margin=128):
+        self.client, self.tools = client, tools
+        self.limit = getattr(client, "context_window", None)
+        self.output_tokens, self.margin = output_tokens, margin
+        self.tokenizer_available = None
+        self.source = "server tokenizer"
+        self.peak_prompt = 0
+        self.peak_reserved = 0
+
+    def count(self, messages):
+        if self.tokenizer_available is not False and hasattr(self.client, "count_prompt_tokens"):
+            try:
+                control = getattr(self.client, "control", None)
+                operation = lambda: self.client.count_prompt_tokens(messages)
+                count = control.call(operation, self.client.timeout, "tokenizer") if control else operation()
+                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                    raise ValueError("Invalid token count")
+                self.tokenizer_available = True
+                return count
+            except RunCancelled:
+                raise
+            except Exception as exc:
+                if control and control.stopped:
+                    raise RunCancelled(control.reason)
+                if isinstance(exc, HTTPError) and exc.code == 429:
+                    control = getattr(self.client, "control", None)
+                    if control:
+                        control.terminate("overload", "HTTP 429 from tokenizer endpoint")
+                        raise RunCancelled(control.reason)
+                self.tokenizer_available = False
+        self.source = "conservative UTF-8 size estimate (tokenizer unavailable)"
+        encoded = json.dumps({"messages": messages, "tools": self.tools}, ensure_ascii=False).encode()
+        return len(encoded) + 32 * len(messages) + 128
+
+    def check(self, messages, label="request"):
+        if not self.limit:
+            return None
+        count = self.count(messages)
+        reserved = count + self.output_tokens + self.margin
+        self.peak_prompt = max(self.peak_prompt, count)
+        self.peak_reserved = max(self.peak_reserved, reserved)
+        if reserved > self.limit:
+            raise ContextLimitReached(f"{label}: estimated {count:,} input + {self.output_tokens:,} output "
+                                      f"+ {self.margin:,} margin exceeds {self.limit:,}-token context")
+        return count
+
+    def check_task(self, messages, task, padding):
+        preview = list(messages)
+        for stage, arguments, result in [
+            ("search_records", {"id": task["target"]["id"]}, {"path": task["path"]}),
+            ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding}),
+        ]:
+            call_id = "budget-" + "x" * 100
+            preview.append({"role": "assistant", "content": None, "tool_calls": [{
+                "id": call_id, "type": "function", "function": {"name": stage, "arguments": json.dumps(arguments)}}]})
+            preview.append({"role": "tool", "tool_call_id": call_id,
+                            "content": json.dumps({**result, "validation_error": " " * 512})})
+        # No transformed answer is supplied, even to the tokenizer endpoint.
+        return self.check(preview, "next task")
+
+    def snapshot(self):
+        return {"window": self.limit, "source": self.source, "output_reserve": self.output_tokens,
+                "margin": self.margin, "peak_estimated_prompt": self.peak_prompt,
+                "peak_reserved_context": self.peak_reserved}
+
+
+VERSION = "ripal-v7"
 TARGET_RATIO = 4.0
 WORDS = "amber birch cedar delta ember fern garden harbor island jungle kettle lantern maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr".split()
 SYSTEM = """Complete the synthetic workspace tasks using the requested tools.
@@ -786,7 +901,7 @@ TOOLS = [
 
 @dataclass(frozen=True)
 class Config:
-    tasks: int = 4
+    tasks: int = 8
     records: int = 2
     words: int = 256
     filler_words: int = 1536
@@ -795,7 +910,7 @@ class Config:
     retries: int = 0
     strict: bool = False
     adaptive_mix: bool = True
-    history_mode: str = "auto"
+    history_mode: str = "full"
     filler: bool = True
 
 
@@ -911,6 +1026,7 @@ class Client:
     supports_stream_cancel = True
 
     def __init__(self, base_url, model, api_key="", timeout=60, extra=None, cache_policy="server-default", streaming=True):
+        self.base_url = base_url.rstrip("/")
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.timeout = model, api_key, timeout
         self.extra = extra or {}
@@ -919,6 +1035,35 @@ class Client:
         protected = {"model", "messages", "tools", "tool_choice", "stream", "n"}
         if protected.intersection(self.extra):
             raise ValueError(f"extra-body cannot override {sorted(protected)}")
+
+    def json_request(self, url, body=None):
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            return json.load(response)
+
+    def discover_context_limit(self):
+        catalog = self.json_request(self.base_url + "/models")
+        model = next((m for m in catalog.get("data", []) if m.get("id") == self.model), None)
+        if model is None:
+            raise ValueError(f"Model {self.model!r} not found in /models; use --context-window to supply its limit")
+        for field in ("max_model_len", "context_length", "max_context_length", "context_window"):
+            limit = model.get(field)
+            if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+                return {"limit": limit, "source": f"/models {field}"}
+        raise ValueError("Model metadata has no context limit; supply --context-window")
+
+    def count_prompt_tokens(self, messages):
+        root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
+        body = {"model": self.model, "messages": messages, "tools": TOOLS, "add_generation_prompt": True}
+        for key in ("chat_template_kwargs", "chat_template"):
+            if key in self.extra:
+                body[key] = self.extra[key]
+        result = self.json_request(root + "/tokenize", body)
+        count = result.get("count")
+        return count if count is not None else len(result["tokens"])
 
     def complete(self, messages, stage, config, cancel_control=None):
         body = {"temperature": 0, "max_tokens": config.max_tokens, **self.extra,
@@ -938,24 +1083,32 @@ class Client:
             return json.load(response)
 
 
-def run_session(client, config, tasks, session):
+def run_session(client, config, tasks, session, state=None):
     started = time.perf_counter()
-    messages = [{"role": "system", "content": SYSTEM},
-                {"role": "user", "content": f"Start with task ID {tasks[0]['target']['id']}."}]
+    state = state if state is not None else {}
+    messages = state.get("messages")
+    if messages is None:
+        messages = [{"role": "system", "content": SYSTEM}]
+    messages.append({"role": "user", "content": f"Start with task ID {tasks[0]['target']['id']}."})
     calls = retries = completed = attempted = exercised = 0
     usage, requests, task_results = {}, [], []
     error = None
     interrupted = False
+    context_limited = False
+    context_reason = None
     ui = getattr(client, "progress", None)
     control = getattr(client, "control", None)
-    mix_control = MixController(config.filler_words, config.adaptive_mix, config.history_mode,
+    mix_control = MixController(state.get("padding", config.filler_words), config.adaptive_mix, config.history_mode,
                                 TARGET_RATIO, getattr(client, "ratio_tolerance", .15))
+    output_reserve = int(getattr(client, "extra", {}).get("max_completion_tokens", getattr(client, "extra", {}).get("max_tokens", config.max_tokens)))
+    budget = state.get("budget") or ContextBudget(client, TOOLS, output_reserve)
     compact_before = False
     try:
+        if state.get("context_reason"):
+            raise ContextLimitReached(state["context_reason"])
         for index, task in enumerate(tasks):
             if control:
                 control.check()
-            attempted += 1
             task_ok, aborted = True, False
             dependency_ok, quality_credit, edit = True, 0.0, None
             target = task["target"]
@@ -965,6 +1118,8 @@ def run_session(client, config, tasks, session):
             padding_words = mix_control.padding
             padding = task["read_padding"] if padding_words == config.filler_words else " ".join(
                 random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
+            budget.check_task(messages, task, padding)
+            attempted += 1
             task_request_start = len(requests)
             if ui:
                 ui.lane(session, padding=padding_words)
@@ -979,6 +1134,7 @@ def run_session(client, config, tasks, session):
                 for attempt in range(config.retries + 1):
                     if control:
                         control.check()
+                    budget.check(messages, stage)
                     if stage == "submit_result":
                         quality_credit, edit = 0.0, None
                     if ui:
@@ -1125,6 +1281,10 @@ def run_session(client, config, tasks, session):
                 messages.append({"role": "user", "content": f"Continue with task ID {next_id}."})
             if ui:
                 ui.lane(session, completed=completed, finished=index + 1, failures=index + 1 - completed, status="ready")
+    except ContextLimitReached as exc:
+        context_limited = True
+        context_reason = str(exc)
+        emit(client, f"CONTEXT lane {session + 1}: {context_reason}; no further tasks added")
     except RunCancelled:
         interrupted = True
     except Exception as exc:
@@ -1135,12 +1295,15 @@ def run_session(client, config, tasks, session):
             ui.log(f"FAIL lane {session + 1}: {error}")
     if ui:
         ui.lane(session, completed=completed, finished=len(task_results) if interrupted else attempted,
-                failures=attempted - completed - int(interrupted and attempted > len(task_results)),
-                status="cancelled" if interrupted else "stopped" if error else "completed")
+                failures=attempted - completed - int((interrupted or context_limited) and attempted > len(task_results)),
+                status="cancelled" if interrupted else "context limit" if context_limited else "stopped" if error else "completed")
+    state.update({"messages": messages, "padding": mix_control.padding, "budget": budget, "context_reason": context_reason})
     return {"session": session, "seconds": time.perf_counter() - started, "planned_tasks": len(tasks),
             "attempted_tasks": attempted, "completed_tasks": completed,
-            "failed_tasks": attempted - completed - int(interrupted and attempted > len(task_results)),
+            "failed_tasks": attempted - completed - int((interrupted or context_limited) and attempted > len(task_results)),
             "interrupted": interrupted, "unfinished_tasks": len(tasks) - len(task_results),
+            "context_limited": context_limited, "context_reason": context_reason,
+            "context_skipped_tasks": len(tasks) - attempted if context_limited else 0, "context_budget": budget.snapshot(),
             "cancelled_requests": sum(r.get("cancelled", False) for r in requests),
             "load_completed_tasks": exercised, "task_results": task_results,
             "mix_adjustments": mix_control.events,
@@ -1152,12 +1315,16 @@ def run_session(client, config, tasks, session):
             "requests": requests, "error": error}
 
 
-def run_profile(client, config, workload, lanes):
+def run_profile(client, config, workload, lanes, warmup_tasks=0):
     if len(workload) != lanes:
         raise ValueError("Each profile requires exactly one session per lane")
     if getattr(client, "control", None) is None:
         client.control = RunControl()
     barrier = threading.Barrier(lanes)
+    measurement_barrier = threading.Barrier(lanes)
+    measurement_started_at = None
+    warmup_started_at = time.perf_counter()
+    warmup_sessions = []
     finished = threading.Event()
     lock = threading.Lock()
     remaining = lanes
@@ -1165,9 +1332,21 @@ def run_profile(client, config, workload, lanes):
     filler_sessions = []
     started = time.perf_counter()
     def worker(index, tasks):
-        nonlocal remaining, primary_finished_at
+        nonlocal remaining, primary_finished_at, measurement_started_at
         barrier.wait()
-        primary = run_session(client, config, tasks, index)
+        state = {}
+        if warmup_tasks:
+            warm_config = replace(config, tasks=warmup_tasks, filler=False)
+            warm_client = PhaseClient(client, "warmup")
+            warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
+            with lock:
+                warmup_sessions.append(warm)
+        measurement_barrier.wait()
+        with lock:
+            if measurement_started_at is None:
+                measurement_started_at = time.perf_counter()
+        measured_client = PhaseClient(client, "measured", warmup_tasks)
+        primary = run_session(measured_client, config, tasks[warmup_tasks:], index, state=state)
         with lock:
             remaining -= 1
             if not remaining:
@@ -1187,6 +1366,8 @@ def run_profile(client, config, workload, lanes):
                 with lock:
                     filler_sessions.append(item)
                 sequence += 1
+                if item.get("context_limited"):
+                    break
             ui = getattr(client, "progress", None)
             if ui:
                 ui.lane(index, status="cancelled" if stop_requested(client) else "completed")
@@ -1194,7 +1375,8 @@ def run_profile(client, config, workload, lanes):
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         futures = [pool.submit(worker, index, tasks) for index, tasks in enumerate(workload)]
         sessions = [future.result() for future in futures]
-    elapsed = (primary_finished_at or time.perf_counter()) - started
+    elapsed = (primary_finished_at or time.perf_counter()) - (measurement_started_at or started)
+    warmup_seconds = (measurement_started_at or time.perf_counter()) - warmup_started_at
     valid = all(s["error"] is None and s["completed_tasks"] == config.tasks for s in sessions)
     credit = sum(s["load_completed_tasks"] for s in sessions) / config.tasks
     primary_mix = token_mix(s["token_mix"] for s in sessions)
@@ -1207,6 +1389,8 @@ def run_profile(client, config, workload, lanes):
             "score": score(credit, elapsed) if not config.strict or valid else None,
             "effective_sessions": credit, "sessions": sessions, "token_mix": observed_mix,
             "primary_token_mix": primary_mix, "filler_sessions": filler_sessions,
+            "warmup_sessions": warmup_sessions, "warmup_seconds": warmup_seconds,
+            "has_measurements": any(s["requests"] for s in sessions),
             "filler_completed_tasks": sum(s["load_completed_tasks"] for s in filler_sessions),
             "filler_cancelled_requests": sum(s["cancelled_requests"] for s in filler_sessions),
             "filler_response_failures": sum(s["response_failures"] for s in filler_sessions),
@@ -1304,7 +1488,9 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
     passed = sum(s.get("completed_tasks", 0) for s in sessions)
     failed = sum(s.get("failed_tasks", 0) for s in sessions)
     accuracy = passed / planned if planned else None
-    quality = sum(s.get("quality_credit", s.get("completed_tasks", 0)) for s in sessions) / planned if planned else None
+    context_skipped = sum(s.get("context_skipped_tasks", 0) for s in sessions)
+    quality_tasks = planned - context_skipped
+    quality = sum(s.get("quality_credit", s.get("completed_tasks", 0)) for s in sessions) / quality_tasks if quality_tasks else None
     edit_score = score(lanes * quality, mean) if scored and quality is not None else None
     return {"profile": f"RIPAL-{lanes}L", "valid": valid, "measured_runs": len(runs),
             "interrupted": interrupted,
@@ -1314,6 +1500,8 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
             "correct": correct, "token_mix": mix, "mix_valid": mix_valid,
             "score_status": "interrupted_partial" if interrupted else "verified" if valid else "with_failures_or_unverified_mix",
             "planned_tasks": planned, "passed_tasks": passed, "failed_tasks": failed,
+            "context_skipped_tasks": context_skipped,
+            "context_limited_sessions": sum(s.get("context_limited", False) for s in sessions),
             "task_accuracy": accuracy,
             "phase_averages": average_phases(sessions, lanes),
             "api_errors": sum(api_error_counts(sessions).values()),
@@ -1365,7 +1553,7 @@ def main():
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
     parser.add_argument("--repeats", type=positive, default=1)
     parser.add_argument("--warmup-tasks", "--warmups", dest="warmup_tasks", type=int, default=2,
-                        help="Unscored tasks per lane, once per profile (default 2; also tunes the token mix). --warmups is an alias.")
+                        help="Unscored tasks at the start of each session (default 2; also tunes the token mix). --warmups is an alias.")
     parser.add_argument("--bootstrap-samples", type=positive, default=5000)
     parser.add_argument("--calibration-rounds", type=int, default=0,
                         help="Optional extra calibration prepass; default 0 uses warmup tasks")
@@ -1374,12 +1562,14 @@ def main():
     parser.add_argument("--ratio-tolerance", type=float, default=.15,
                         help="Relative tolerance around 4:1, default ±15%%")
     parser.add_argument("--filler-words", type=int, default=Config().filler_words)
+    parser.add_argument("--context-window", type=positive,
+                        help="Context limit override if /models does not advertise it; lower limits are allowed")
     parser.add_argument("--no-filler", dest="filler", action="store_false",
                         help="Let early-finishing lanes idle instead of running tail filler tasks")
     parser.add_argument("--fixed-mix", dest="adaptive_mix", action="store_false",
                         help="Disable runtime padding feedback (enabled by default)")
-    parser.add_argument("--history", dest="history_mode", choices=["auto", "full", "task"], default="auto",
-                        help="auto compacts completed tasks when cache reuse is absent or prefill exceeds budget")
+    parser.add_argument("--history", dest="history_mode", choices=["auto", "full", "task"], default=Config().history_mode,
+                        help="full retains warmup + test history (default); auto/task permit compaction")
     parser.add_argument("--cache-policy", choices=["server-default", "enabled", "disabled"], default="server-default",
                         help="Declare server policy; disabled permits zero-cache accounting when absent. Configure the server separately.")
     for name in ("tasks", "records", "words", "max_tokens"):
@@ -1429,7 +1619,7 @@ def main():
 
 def max_completed_response_seconds(run):
     values = [request["seconds"]
-              for session in run.get("sessions", []) + run.get("filler_sessions", [])
+              for session in run.get("sessions", []) + run.get("filler_sessions", []) + run.get("warmup_sessions", [])
               for request in session.get("requests", [])
               if request.get("received_response") and not request.get("cancelled")
               and request.get("validation", {}).get("kind") not in {"tool_timeout", "server_overload"}
@@ -1457,8 +1647,37 @@ def batch_schedule(lanes, repeats, warmup_tasks):
             yield False, repeat, level
 
 
+def configure_context(client, override=None):
+    control = getattr(client, "control", None)
+    try:
+        operation = client.discover_context_limit
+        info = control.call(operation, client.timeout, "model metadata") if control else operation()
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        if isinstance(exc, HTTPError) and exc.code == 429 and control:
+            control.terminate("overload", "HTTP 429 while reading model context metadata")
+            raise RunCancelled(control.reason)
+        if override is None:
+            raise ValueError(f"Cannot read model context limit: {exc}. Supply --context-window.") from exc
+        info = {"limit": override, "source": "--context-window override"}
+    if override is not None and override < info["limit"]:
+        info = {"limit": override, "source": "--context-window cap", "model_limit": info["limit"]}
+    client.context_window = info["limit"]
+    return info
+
+
 def run_benchmark(args, client, config):
     requested_config = config
+    try:
+        context_info = configure_context(client, args.context_window)
+        emit(client, f"Model context limit: {context_info['limit']:,} tokens ({context_info['source']})")
+    except Exception as exc:
+        report = {"version": VERSION, "model": args.model, "base_url": args.base_url,
+                  **termination_state(client), "config": asdict(config), "context_error": str(exc),
+                  "scores": {}, "summaries": {}, "runs": [], "warmup_runs": []}
+        write_results(args, client, report)
+        return client.control.exit_code if stop_requested(client) else 2
     calibration = {"source": "warmup_tasks", "skipped": args.warmup_tasks == 0, "valid": False, "rounds": [], "warmup_profiles": []}
     if args.calibration_rounds and not args.skip_calibration:
         config, calibration = calibrate_mix(client, config, TARGET_RATIO,
@@ -1486,26 +1705,23 @@ def run_benchmark(args, client, config):
     warmups = []
     profile_padding = {lanes: config.filler_words for lanes in args.lanes}
     profile_maxima = {}
-    for is_warmup, repeat, lanes in batch_schedule(args.lanes, args.repeats, args.warmup_tasks):
+    for _, repeat, lanes in batch_schedule(args.lanes, args.repeats, 0):
         if stop_requested(client):
             break
         deadline, previous_lanes, previous_max = profile_timeout(lanes, args.lanes, profile_maxima, args.timeout)
         client.timeout = deadline
         basis = f"4 × {previous_lanes}L max {previous_max:.2f}s" if previous_max is not None else "initial deadline"
         emit(client, f"RIPAL-{lanes}L response deadline {deadline:.2f}s ({basis})")
-        # Fresh content per profile/repetition, deterministic across models.
-        seed_text = f"{args.seed}:{'warmup' if is_warmup else 'measured'}:{repeat}:{lanes}"
+        seed_text = f"{args.seed}:session:{repeat}:{lanes}"
         batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
-        batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes],
-                               tasks=args.warmup_tasks if is_warmup else config.tasks,
-                               filler=False if is_warmup else config.filler)
-        phase = (f"Warmup {batch_config.tasks} task(s)/lane" if is_warmup else
-                 f"Measured repeat {repeat + 1}/{args.repeats}")
+        batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes])
         ui = getattr(client, "progress", None)
         if ui:
-            ui.begin(f"RIPAL-{lanes}L · {phase} · deadline {deadline:.1f}s", lanes, batch_config.tasks, batch_config.filler_words)
-        workload = [make_session(batch_config, index) for index in range(lanes)]
-        run = run_profile(client, batch_config, workload, lanes)
+            ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {config.tasks} measured · deadline {deadline:.1f}s",
+                     lanes, args.warmup_tasks + config.tasks, batch_config.filler_words)
+        workload_config = replace(batch_config, tasks=args.warmup_tasks + config.tasks)
+        workload = [make_session(workload_config, index) for index in range(lanes)]
+        run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks)
         run["tool_timeout_seconds"] = deadline
         run["timeout_basis"] = {"previous_lanes": previous_lanes, "previous_max_seconds": previous_max, "multiplier": 4}
         observed_max = max_completed_response_seconds(run)
@@ -1514,34 +1730,34 @@ def run_benchmark(args, client, config):
         run["repeat"] = repeat + 1
         run["tasks_per_session"] = batch_config.tasks
         run["initial_padding_words"] = batch_config.filler_words
-        next_padding = [s["mix_adjustments"][-1]["next_padding_words"] for s in run["sessions"] if s.get("mix_adjustments")]
+        next_padding = [session["mix_adjustments"][-1]["next_padding_words"] for session in run["sessions"]
+                        if session.get("mix_adjustments")]
         if config.adaptive_mix and next_padding:
             profile_padding[lanes] = round(statistics.median(next_padding))
         run["next_batch_padding_words"] = profile_padding[lanes]
-        if is_warmup:
-            calibration.setdefault("warmup_profiles", []).append({"lanes": lanes,
-                "initial_padding_words": batch_config.filler_words, "next_padding_words": profile_padding[lanes],
-                "token_mix": run["token_mix"]})
+        warm_sessions = run.pop("warmup_sessions")
+        if warm_sessions:
+            warm_mix = token_mix(session["token_mix"] for session in warm_sessions)
+            warmups.append({"lanes": lanes, "repeat": repeat + 1, "sessions": warm_sessions,
+                            "seconds": run["warmup_seconds"], "tasks_per_session": args.warmup_tasks,
+                            "valid": all(session["completed_tasks"] == args.warmup_tasks for session in warm_sessions),
+                            "token_mix": warm_mix, "seed": batch_seed})
+            calibration.setdefault("warmup_profiles", []).append({"lanes": lanes, "token_mix": warm_mix})
             calibration["valid"] = all(mix_matches(p["token_mix"], TARGET_RATIO, args.ratio_tolerance)
                                         for p in calibration["warmup_profiles"])
         run["seed"] = batch_seed
         run["workload_sha256"] = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
-        (warmups if is_warmup else runs).append(run)
+        if run["has_measurements"] or not stop_requested(client):
+            runs.append(run)
         points = f"{run['score']:.1f}" if run["score"] is not None else "unavailable"
-        phase = "warmup" if is_warmup else "measured"
-        failed_tasks = sum(s["failed_tasks"] for s in run["sessions"])
-        emit(client, f"RIPAL-{lanes}L {phase}={repeat + 1} seconds={run['seconds']:.3f} "
-             f"provisional_load_score={points} failed_tasks={failed_tasks}")
-        for session in run["sessions"]:
-            if session["error"]:
-                emit(client, f"  session={session['session']}: {session['error']}")
+        emit(client, f"RIPAL-{lanes}L measured={repeat + 1} seconds={run['seconds']:.3f} provisional_load_score={points}")
     summaries = {}
     for lanes in args.lanes:
         group = [run for run in runs if run["lanes"] == lanes]
         if not group:
             continue
         summaries[str(lanes)] = summarize(group, lanes, args.bootstrap_samples, args.seed + lanes,
-                                         all(run["valid"] for run in warmups if run["lanes"] == lanes),
+                                         True,
                                          TARGET_RATIO, args.ratio_tolerance, allow_failures=not args.strict)
         summary = summaries[str(lanes)]
         points = f"{summary['score']:.1f}" if summary["score"] is not None else "INVALID"
@@ -1564,16 +1780,17 @@ def run_benchmark(args, client, config):
               "unmeasured_lanes": [n for n in args.lanes if str(n) not in summaries],
               "requested_lanes": args.lanes,
               "config": asdict(config), "cache_policy": args.cache_policy,
+              "model_context": context_info,
               "requested_config": asdict(requested_config), "calibration": calibration,
               "target_fresh_per_output": TARGET_RATIO, "ratio_tolerance": args.ratio_tolerance,
               "measurement": {"warmup_tasks_per_lane": args.warmup_tasks,
-                              "warmup_batches_per_profile": int(args.warmup_tasks > 0), "repeats": args.repeats,
+                              "warmups_in_same_session": True, "repeats": args.repeats,
                               "bootstrap_samples": args.bootstrap_samples, "session_count": "equals lanes",
                               "initial_tool_timeout_seconds": args.timeout,
                               "tool_timeout_policy": "4x previous concurrency maximum completed response",
                               "max_completed_response_seconds_by_lanes": profile_maxima,
                               "mix_control": "adaptive" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
-                              "seed_policy": "SHA256(base_seed:phase:repeat:lanes), distinct content per batch"},
+                              "seed_policy": "SHA256(base_seed:session:repeat:lanes), warmup and measured task histories concatenated"},
               "score_formula": "1000 * asinh(60 * mean_effective_sessions / mean_batch_seconds) / asinh(1)",
               "failure_policy": "strict" if args.strict else "continue; load score and accuracy reported separately",
               "quality_method": "character Levenshtein: 1 - distance/max(expected_length, received_length); "
