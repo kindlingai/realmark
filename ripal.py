@@ -216,7 +216,7 @@ def read_stream(response, started, control=None):
             generated = False
             for key in ("content", "reasoning_content", "reasoning"):
                 value = delta.get(key)
-                if value:
+                if isinstance(value, str) and value:
                     target = "reasoning_content" if key == "reasoning" else key
                     message[target] = (message.get(target) or "") + value
                     generated = True
@@ -296,6 +296,7 @@ MUTED = "38;2;146;137;123"
 ORANGE = "38;2;255;112;25"
 AMBER = "38;2;234;181;49"
 WARNING = "38;2;239;106;80"
+WHITE = "38;2;255;255;255"
 STYLES = {"0": CREAM, "1": "1;" + CREAM, "2": MUTED,
           "1;36": "1;" + CREAM, "1;34": MUTED, "36": ORANGE,
           "31": WARNING, "33": AMBER, "32": AMBER}
@@ -450,7 +451,15 @@ class TerminalUI:
                 if any(char.isdigit() for char in line):
                     return AMBER
                 return MUTED
-            lines = [f"\x1b[{BACKGROUND};{style(line)}m{line}\x1b[0m" for line in lines]
+            colored = []
+            for line in lines:
+                if line.startswith(("╭", "╰")):
+                    colored.append(f"\x1b[{BACKGROUND};{WHITE}m{line}\x1b[0m")
+                elif line.startswith("│") and line.endswith("│"):
+                    colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{style(line)}m{line[1:-1]}\x1b[{WHITE}m│\x1b[0m")
+                else:
+                    colored.append(f"\x1b[{BACKGROUND};{style(line)}m{line}\x1b[0m")
+            lines = colored
         with self.lock:
             self.finals.extend(lines)
             self.events.append("Result card saved; restoring terminal.")
@@ -467,32 +476,34 @@ class TerminalUI:
 
 
 def braille_plot(points, width=32, height=4):
-    """Draw a real 2x4-dot-per-character plot; missing scores leave gaps."""
+    """Plot actual concurrency on X and autoscale Y to finite observed values."""
     if width < 1 or height < 1:
         raise ValueError("plot dimensions must be positive")
-    points = sorted(points)
-    if not points or any(lanes <= 0 for lanes, _ in points):
+    points = sorted((n, value if value is not None and math.isfinite(value) else None) for n, value in points)
+    if not points or any(n <= 0 for n, _ in points):
         raise ValueError("positive lane counts are required")
+    known = [(n, value) for n, value in points if value is not None]
+    xmin, xmax = (known[0][0], known[-1][0]) if known else (points[0][0], points[-1][0])
+    ymin = min((value for _, value in known), default=0)
+    ymax = max((value for _, value in known), default=0)
     w, h = width * 2, height * 4
-    pixels = set()
-    xs = [math.log2(lanes) for lanes, _ in points]
-    maximum = max((value for _, value in points if value is not None), default=0)
-    ceiling = maximum if maximum > 0 else 1
-    def position(index, value):
-        x = round((xs[index] - xs[0]) / (xs[-1] - xs[0]) * (w - 1)) if xs[-1] != xs[0] else w // 2
-        y = round((1 - value / ceiling) * (h - 1))
+    pixels, labels = set(), [" "] * width
+    def position(n, value):
+        x = round((n - xmin) / (xmax - xmin) * (w - 1)) if xmax != xmin else w // 2
+        y = round((ymax - value) / (ymax - ymin) * (h - 1)) if ymax != ymin else h // 2
         return x, max(0, min(h - 1, y))
     previous = None
-    labels = [" "] * width
-    for index, (lanes, value) in enumerate(points):
-        x, _ = position(index, 0)
-        label = str(lanes)
+    for n, value in points:
+        if not xmin <= n <= xmax:
+            continue
+        x, _ = position(n, ymin)
+        label = str(n)[:width]
         offset = max(0, min(width - len(label), x // 2 - len(label) // 2))
         labels[offset:offset + len(label)] = label
         if value is None:
             previous = None
             continue
-        current = position(index, value)
+        current = position(n, value)
         pixels.add(current)
         if previous is not None:
             dx, dy = current[0] - previous[0], current[1] - previous[1]
@@ -510,9 +521,34 @@ def braille_plot(points, width=32, height=4):
                        if (col * 2 + dx, row * 4 + dy) in pixels)
             cells.append(chr(0x2800 + mask) if mask else " ")
         lines.append("".join(cells))
-    return {"lines": lines, "labels": "".join(labels), "max_score": maximum,
-            "x_axis": "concurrency (lanes, log2)", "y_axis": "load score (linear, zero baseline)",
-            "points": [{"lanes": n, "score": value} for n, value in points]}
+    return {"lines": lines, "labels": "".join(labels), "has_data": bool(known),
+            "min_score": ymin, "max_score": ymax, "x_min": xmin, "x_max": xmax,
+            "y_min": ymin, "y_max": ymax, "x_axis": "concurrency (C, linear)",
+            "y_axis": "observed values, linear, fitted to data",
+            "points": [{"lanes": n, "score": value, "value": value} for n, value in points]}
+
+
+def chart_lines(plot, title, unit):
+    result = [f"{title}  ·  Y: {unit}"]
+    if not plot["has_data"]:
+        return result + ["  No measured data available."]
+    span = plot["y_max"] - plot["y_min"]
+    decimals = max(0, min(4, -math.floor(math.log10(span / 3)))) if span > 0 else 2
+    def label(value):
+        return f"{value:,.{decimals}f}"
+    for index, line in enumerate(plot["lines"]):
+        tick = ""
+        if span == 0 and index == len(plot["lines"]) // 2:
+            tick = label(plot["y_min"])
+        elif span > 0 and index == 0:
+            tick = label(plot["y_max"])
+        elif span > 0 and index == len(plot["lines"]) - 1:
+            tick = label(plot["y_min"])
+        result.append(f"{tick:>11} │{line}")
+    result.append(" " * 12 + "└" + "─" * len(plot["lines"][0]))
+    result.append(" " * 13 + plot["labels"])
+    result.append(f"             X: concurrency (C), {plot['x_min']}–{plot['x_max']}")
+    return result
 
 
 def result_card(report, width=98):
@@ -547,7 +583,7 @@ def result_card(report, width=98):
         if report.get("unmeasured_lanes"):
             add("Not measured: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
     add()
-    add("Lanes  Load score  Edit.score   Match   Failed tasks  Resp.err    Mix")
+    add("Lanes  Load score    Match   Failed tasks  Resp.err    Mix")
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
     for lanes, summary in summaries:
         def number(value):
@@ -558,8 +594,7 @@ def result_card(report, width=98):
         marker = "" if summary["valid"] and not summary.get("response_failures") else "*"
         quality = summary.get("edit_quality")
         match = f"{quality:.1%}" if quality is not None else "—"
-        add(f"{int(lanes):>3}L {number(summary['score']) + marker:>10}  "
-            f"{number(summary.get('edit_adjusted_score', summary.get('accuracy_adjusted_score'))):>10}  {match:>6}  "
+        add(f"{int(lanes):>3}L {number(summary['score']) + marker:>10}  {match:>7}  "
             f"{summary.get('failed_tasks', 0):>4}/{summary.get('planned_tasks', 0):<5}  "
             f"{summary.get('response_failures', 0):>6}  {mix:>9}")
     add()
@@ -576,11 +611,15 @@ def result_card(report, width=98):
         add("~ Streaming estimates per request; prefill includes queue/network delay.")
         add()
         plot = report.get("score_plot") or braille_plot([(int(n), s["score"]) for n, s in summaries])
-        add(f"Load score vs concurrency  ·  top {plot['max_score']:,.1f}  ·  baseline 0")
-        for line in plot["lines"]:
-            add("  " + line)
-        add("  " + plot["labels"])
-        add("  lanes (log2 spacing); score uses a linear y-axis")
+        for line in chart_lines(plot, "Load score", "points"):
+            add(line)
+        for key, title in (("decode_tokens_per_second", "Average decode~"),
+                           ("prefill_tokens_per_second", "Average prefill~")):
+            add()
+            metric_plot = report.get("metric_plots", {}).get(key) or braille_plot([
+                (int(n), summary.get("phase_averages", {}).get(key)) for n, summary in summaries])
+            for line in chart_lines(metric_plot, title, "tok/s"):
+                add(line)
     else:
         add("No measured scores available.")
     add()
@@ -594,7 +633,7 @@ def result_card(report, width=98):
     if filler_tasks or filler_cancelled or filler_errors:
         add(f"Unscored filler: {filler_tasks} tasks · {filler_errors} response errors · {filler_cancelled} cancelled tails")
         add("~ Token ratio uses received responses; cancelled filler usage is unknown.")
-    add("Load score: completed cycles. Edit score: similarity-weighted work.")
+    add("Load score: completed cycles. Match: edit-distance quality credit.")
     add("* Errors or unverified mix. Timing CIs and full details are in JSON.")
     if report.get("measurement", {}).get("mix_control") == "adaptive":
         all_sessions = [r["session"] for r in calibration.get("rounds", [])]
@@ -1492,6 +1531,9 @@ def write_results(args, client, report):
     if report.get("summaries"):
         report["score_plot"] = braille_plot([(n, report["summaries"].get(str(n), {}).get("score"))
             for n in report.get("requested_lanes", [int(n) for n in report["summaries"]])])
+        report["metric_plots"] = {key: braille_plot([(int(n), s.get("phase_averages", {}).get(key))
+            for n, s in report["summaries"].items()])
+            for key in ("decode_tokens_per_second", "prefill_tokens_per_second")}
     width = min(98, shutil.get_terminal_size((100, 32)).columns - 1)
     report["final_card"] = result_card(report, width=width)
     report["card_path"] = str(card_path.resolve())

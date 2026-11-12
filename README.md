@@ -12,7 +12,7 @@ For authentication, set `OPENAI_API_KEY` (or select another variable with `--api
 Defaults: two warmup tasks, then one measured pass of four tasks per lane.
 Each concurrency level is warmed and measured before starting the next.
 Adaptive padding/history target 4:1 fresh-input/decode; early lanes run unscored filler.
-Reports load and edit-distance-adjusted scores, errors, and a braille concurrency plot.
+Reports load score, edit-distance match %, errors, and autoscaled braille charts with axes.
 Streams responses to estimate prefill/decode tok/s and average completion time per concurrency.
 Prefill estimates include queue/network time; streaming chunks may buffer tokens.
 Saves `ripal-results.json` and `ripal-results.card.txt`.
