@@ -332,13 +332,13 @@ def difference_lines(expected, received, color=False, width=110, prefix=""):
             used += len(text)
             if color:
                 style = f"1;4;{foreground};48;2;65;43;25" if changed else f"{BACKGROUND};{MUTED}"
-                rendered.append(f"\x1b[{style}m{text}")
+                rendered.append(f"\x1b[0;{style}m{text}")
             else:
                 rendered.append(text)
             if not remaining:
                 break
         if color:
-            rendered.append(f"\x1b[{BACKGROUND};{MUTED}m" + " " * max(0, width - 1 - used) + "\x1b[0m")
+            rendered.append(f"\x1b[0;{BACKGROUND};{MUTED}m" + " " * max(0, width - 1 - used) + "\x1b[0m")
         lines.append("".join(rendered))
     return lines
 
