@@ -753,8 +753,8 @@ class TerminalUI:
             score_span = None
             in_table = False
             for line in lines:
-                if "RIPALmark" in line and "Completed" in line:
-                    score_span = (line.index("RIPALmark") - 1, line.index("RIPALmark") - 1 + len("RIPALmark"))
+                if "RIPAL Score" in line and "Completed" in line:
+                    score_span = (line.index("RIPAL Score") - 1, line.index("RIPAL Score") - 1 + len("RIPAL Score"))
                     in_table = True
                 elif not line.strip("│ "):
                     in_table = False
@@ -766,7 +766,7 @@ class TerminalUI:
                     if in_table and score_span:
                         a, b = score_span
                         content = content[:a] + "\x1b[1m" + content[a:b] + "\x1b[22m" + content[b:]
-                    for heading in ("RIPALmark  ·  Y: points ±1σ", "Total decode~  ·  Y: tok/s ±1σ", "Total prefill~  ·  Y: tok/s ±1σ"):
+                    for heading in ("RIPAL Score  ·  Y: points ±1σ", "Total decode~  ·  Y: tok/s ±1σ", "Total prefill~  ·  Y: tok/s ±1σ"):
                         content = content.replace(heading,
                             f"\x1b[0;{BACKGROUND};{MUTED}m{heading}\x1b[0;{BACKGROUND};{base}m")
                     colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{base}m{content}\x1b[{WHITE}m│\x1b[0m")
@@ -916,7 +916,7 @@ def chart_lines(plot, title, unit):
     return result
 
 
-CARD_COLUMNS = (("C", 3), ("RIPALmark", 9), ("Decode (tok/s)", 14), ("Prefill (tok/s)", 15),
+CARD_COLUMNS = (("C", 3), ("RIPAL Score", 11), ("Decode (tok/s)", 14), ("Prefill (tok/s)", 15),
                 ("Completed", 9), ("Time (s)", 8), ("Match (%)", 10), ("Mix (w / t)", 11))
 
 
@@ -970,7 +970,7 @@ def chart_grid(summaries, width):
     gutter = max(*map(len, axis_labels(plot)), len(middle_label(plot)))
     plot = braille_plot([(int(n), s["score"]) for n, s in summaries],
                         width=left_width - gutter - 2, height=len(right) - 4, errors={int(n): s.get("score_stdev") for n, s in summaries})
-    left = chart_lines(plot, "RIPALmark", "points")
+    left = chart_lines(plot, "RIPAL Score", "points")
     left += [""] * (len(right) - len(left))
     return [a.ljust(left_width) + " " * gap + b for a, b in zip(left, right)]
 
