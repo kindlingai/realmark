@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """RIPAL Mark: local prefill/decode load benchmark. Python standard library only."""
 
+from collections import Counter
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -22,8 +23,10 @@ import signal
 import socket
 import statistics
 import sys
+import textwrap
 import threading
 import time as real_time
+import unicodedata
 import urllib.request
 
 
@@ -1020,12 +1023,18 @@ def result_card(report, width=98):
     def table_row(values):
         return "  ".join(str(value).rjust(size) for value, (_, size) in zip(values, CARD_COLUMNS))
     add(table_row([label for label, _ in CARD_COLUMNS]))
+    notes = report.get("diagnostics", [])
+    superscripts = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+    def markers(lanes, column):
+        return "".join(str(index).translate(superscripts) for index, note in enumerate(notes, 1)
+                       if int(lanes) in note["lanes"] and column in note["columns"])
     for lanes, summary in summaries:
+        suffix = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time")}
         ratio = summary["token_mix"].get("fresh_per_output")
         words = summary.get("word_mix", {}).get("input_per_output")
         approximate = summary.get("mix_excludes_cancelled_filler_usage", False)
         prefix = "~" if approximate else ""
-        space = (11 - 3 - len(prefix)) // 2
+        space = (11 - len(suffix["mix"]) - 3 - len(prefix)) // 2
         mix = prefix + compact_number(words, space) + "w/" + compact_number(ratio, space) + "t"
         planned = summary.get("planned_tasks", 0)
         complete = summary.get("load_completed_tasks", planned)
@@ -1034,13 +1043,18 @@ def result_card(report, width=98):
             completed = f"{compact_number(complete, 4, 0)}/{compact_number(planned, 4, 0)}"
         quality = summary.get("edit_quality")
         match = match_label(quality)
+        available = 10 - len(suffix["match"])
+        if len(match) > available:
+            match = match.replace(" (", "(")
+        if len(match) > available and quality is not None:
+            match = f"{quality:.0%}(" + match.rsplit("(", 1)[-1]
         estimated = summary.get("time_limited")
         seconds = summary.get("estimated_full_seconds") if estimated else summary.get("mean_seconds")
-        elapsed = ("~" if estimated else "") + compact_number(seconds, 7 if estimated else 8, 2)
+        elapsed = ("~" if estimated else "") + compact_number(seconds, 8 - int(bool(estimated)) - len(suffix["time"]), 2)
         add(table_row([str(lanes) if len(str(lanes)) <= 3 else compact_number(int(lanes), 3, 0), compact_number(summary["score"], 9),
-                       card_rate(summary, lanes, "decode_tokens_per_second", 14),
-                       card_rate(summary, lanes, "prefill_tokens_per_second", 15),
-                       completed, elapsed, match, mix]))
+                       card_rate(summary, lanes, "decode_tokens_per_second", 14 - len(suffix["decode"])) + suffix["decode"],
+                       card_rate(summary, lanes, "prefill_tokens_per_second", 15 - len(suffix["prefill"])) + suffix["prefill"],
+                       completed, elapsed + suffix["time"], match + suffix["match"], mix + suffix["mix"]]))
     add()
     if summaries:
         for line in chart_grid(summaries, width - 4):
@@ -1062,6 +1076,13 @@ def result_card(report, width=98):
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
+    if notes:
+        add("Notes")
+        for index, note in enumerate(notes, 1):
+            label = str(index).translate(superscripts) + " "
+            for line in textwrap.wrap(note["text"], width=width - 4, initial_indent=label,
+                                      subsequent_indent=" " * len(label)):
+                add(line)
     return "\n".join(["╭" + "─" * (width - 2) + "╮"] +
                      ["│ " + line.ljust(width - 4) + " │" for line in body] +
                      ["╰" + "─" * (width - 2) + "╯"])
@@ -1477,6 +1498,135 @@ def export_report(args, report, protocol, scoring_reference):
         stage['stages'].append({'trial': -(index + 1), 'time': None, 'measured_time': None, 'clock': None, 'measured_clock': None,
                                 'params': {'calibration': True}, 'cap': None})
     return raw
+
+
+def repeated_output(words, expected):
+    best = None
+    for period in range(1, min(64, len(words) // 3) + 1):
+        streak = 0
+        for index in range(period, len(words) + 1):
+            if index < len(words) and words[index] == words[index - period]:
+                streak += 1
+                continue
+            length = streak + period
+            if streak >= 2 * period and length >= 32 and (best is None or length > best['words']):
+                start = index - length
+                if ' '.join(words[start:index]) not in expected:
+                    best = {'start': start + 1, 'period': period, 'words': length,
+                            'repeats': length // period}
+            streak = 0
+    return best
+
+
+def session_diagnostics(raw, transform):
+    notes = []
+    block_counts = []
+    block_lanes = set()
+    for level, profile in raw.get('runs', {}).items():
+        c = int(level.split('=')[1])
+        findings = {'loop': [], 'corruption': [], 'script': [], 'pressure': []}
+        for lane in profile['lanes']:
+            events = sorted([e for phase in ('run', 'partial') for e in lane['telemetry'][phase]],
+                            key=lambda e: e['elapsed'])
+            plans = {(e['session'], e['task']): e['fixture'] for e in events if e['type'] == 'task_start'}
+            requests = {e['request_id']: e for e in events if e['type'] == 'request'}
+            first_times = {}
+            for chunk in events:
+                rid = chunk.get('request_id')
+                if chunk['type'] != 'stream_chunk' or rid in first_times or chunk['data'] == '[DONE]':
+                    continue
+                data = json.loads(chunk['data'])
+                for choice in data.get('choices', []):
+                    delta = choice.get('delta') or {}
+                    if (any(delta.get(k) for k in ('content', 'reasoning', 'reasoning_content')) or
+                            any((call.get('function') or {}).get(k) for call in delta.get('tool_calls') or []
+                                for k in ('name', 'arguments'))):
+                        first_times[rid] = chunk['elapsed']
+                        break
+            previous = None
+            pressure = []
+            for event in events:
+                if event['type'] == 'history_reset':
+                    previous = None
+                if event['type'] != 'response':
+                    continue
+                body = event['body']
+                usage = body.get('usage') or {}
+                cached = (usage.get('prompt_tokens_details') or {}).get('cached_tokens')
+                prompt = usage.get('prompt_tokens')
+                if isinstance(cached, int) and cached > 0:
+                    block_counts.append(cached)
+                    block_lanes.add(c)
+                request = requests.get(event.get('request_id'))
+                first = first_times.get(event.get('request_id'))
+                latency = first - request['elapsed'] if first is not None and request else None
+                if (previous and previous['session'] == event['session'] and
+                        all(isinstance(v, (int, float)) for v in (cached, prompt, latency)) and
+                        previous['cached'] >= 8192 and cached < previous['cached'] * .5 and
+                        prompt >= previous['prompt'] * .9 and latency >= max(2, previous['latency'] * 3)):
+                    pressure.append(f"L{lane['lane']}/T{event['task']}")
+                if all(isinstance(v, (int, float)) for v in (cached, prompt, latency)):
+                    previous = {'session': event['session'], 'cached': cached, 'prompt': prompt, 'latency': latency}
+                if not request or request.get('stage') != 'submit_result':
+                    continue
+                fixture = plans.get((event['session'], event['task']))
+                if not fixture:
+                    continue
+                expected = transform(fixture['target']['payload'], fixture['transformation'])
+                ref = f"L{lane['lane']}/T{event['task']}" + (' partial' if event['phase'] == 'partial' else '')
+                choices = body.get('choices') or []
+                message = choices[0].get('message', {}) if choices else {}
+                text = None
+                for call in message.get('tool_calls') or []:
+                    function = call.get('function') or {}
+                    if function.get('name') != 'submit_result':
+                        continue
+                    arguments = function.get('arguments', '')
+                    try:
+                        supplied = json.loads(arguments) if isinstance(arguments, str) else arguments
+                        text = supplied.get('text') if isinstance(supplied, dict) else None
+                    except (ValueError, TypeError):
+                        # Loop evidence can survive an incomplete tool argument string.
+                        loop = repeated_output(str(arguments).split(), expected)
+                        if loop:
+                            findings['loop'].append((ref, loop))
+                if not isinstance(text, str) or text == expected:
+                    continue
+                loop = repeated_output(text.split(), expected)
+                if loop:
+                    findings['loop'].append((ref, loop))
+                # Word multiset overlap avoids treating one omission as corruption of every later word.
+                wanted, received = Counter(expected.split()), Counter(text.split())
+                overlap = sum((wanted & received).values()) / max(sum(wanted.values()), sum(received.values()), 1)
+                if min(len(expected.split()), len(text.split())) >= 16 and overlap < .7:
+                    findings['corruption'].append((ref, overlap))
+                scripts = Counter()
+                for char in text:
+                    if char.isalpha() and not char.isascii():
+                        name = unicodedata.name(char, '')
+                        script = next((s for s in ('CYRILLIC', 'CJK', 'HIRAGANA', 'KATAKANA', 'HANGUL',
+                                                  'ARABIC', 'HEBREW', 'DEVANAGARI', 'THAI', 'GREEK') if s in name), 'OTHER')
+                        scripts[script] += 1
+                if sum(scripts.values()) >= 16 and sum(scripts.values()) / max(1, sum(ch.isalpha() for ch in text)) >= .05:
+                    findings['script'].append((ref, scripts.most_common(1)[0][0].lower()))
+            if len(pressure) >= 2:
+                findings['pressure'].extend(pressure)
+        if findings['loop']:
+            details = '; '.join(f"{ref}: {loop['words']:,} words repeating a {loop['period']}-word motif" for ref, loop in findings['loop'])
+            notes.append({'lanes': [c], 'columns': ['decode'], 'text': f'C={c} looping detected — {details}.'})
+        if findings['corruption']:
+            details = ', '.join(f'{ref} ({overlap:.0%} expected-word overlap)' for ref, overlap in findings['corruption'])
+            notes.append({'lanes': [c], 'columns': ['match'], 'text': f'C={c} major word corruption — {details}.'})
+        if findings['script']:
+            details = ', '.join(f'{ref} ({script})' for ref, script in findings['script'])
+            notes.append({'lanes': [c], 'columns': ['match'], 'text': f'C={c} unexpected script; possible language switch — {details}.'})
+        if findings['pressure']:
+            notes.append({'lanes': [c], 'columns': ['prefill', 'time'], 'text': f"C={c} cache pressure suspected: repeated cache-hit collapses with ≥3× time to first output ({', '.join(findings['pressure'])}). Queueing can also cause this; server metrics are needed to confirm thrashing."})
+    if len(block_counts) >= 3 and len(set(block_counts)) >= 2:
+        granularity = math.gcd(*block_counts)
+        if 128 <= granularity <= 65536 and granularity & (granularity - 1) == 0:
+            notes.append({'lanes': sorted(block_lanes), 'columns': ['mix'], 'text': f'Cache hits align to {granularity:,}-token units (inferred). Partial-block tails may be re-prefilled; usage totals cannot distinguish those tails from new input or prove the internal block size.'})
+    return notes
 
 
 class VirtualClock:
@@ -3239,6 +3389,7 @@ def report_from_telemetry(raw):
     values = list(report['scores'].values())
     report['geometric_mean_score'] = (math.exp(statistics.mean(math.log(v) for v in values)) if all(v > 0 for v in values) else 0) if values and all(v is not None for v in values) and not stopped else None
     report['unmeasured_lanes'] = [c for c in report['requested_lanes'] if str(c) not in report['summaries']]
+    report['diagnostics'] = session_diagnostics(raw, transform)
     refresh_report_charts(report)
     report['final_card'] = result_card(report)
     return report

@@ -70,3 +70,9 @@ model waits. Prefill/decode capacities are shared across active requests per pha
 Simulator stage/response timeouts are off by default so full schedules finish.
 Use `--stage-timeout N` and `--sim-response-timeouts` to exercise those limits.
 Use `--help` for other options.
+
+Card notes flag long output loops, major expected-word corruption, unexpected
+scripts/possible language switches, suspected cache pressure, and inferred cache-hit
+granularity. Superscript references annotate the relevant table cells. These are
+offline diagnostics, not score adjustments. Cache thrashing needs server-side
+confirmation; block alignment cannot prove partial-tail recomputation.
