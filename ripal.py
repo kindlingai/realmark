@@ -804,18 +804,16 @@ def braille_plot(points, width=32, height=4, errors=None):
         lo, hi = low / step, high / step
         lower = round(lo) - 1 if math.isclose(lo, round(lo), abs_tol=1e-8) else math.floor(lo)
         upper = round(hi) + 1 if math.isclose(hi, round(hi), abs_tol=1e-8) else math.ceil(hi)
-        ymin, ymax = lower * step, upper * step
-        while (low - ymin) / (ymax - ymin) < .5 / (height * 4):
-            ymin -= step
+        ymin, ymax = max(0, lower * step), max(step, upper * step)
     else:
-        ymin, ymax = -.01, .01
+        ymin, ymax = 0, .01
         step = .01
     w, h = width * 2, height * 4
     pixels, labels = set(), [" "] * width
     def position(n, value):
         x = round((n - xmin) / (xmax - xmin) * (w - 1)) if xmax != xmin else w // 2
         y = round(round((ymax - value) / (ymax - ymin), 9) * h) if ymax != ymin else h // 2
-        return x, max(0, min(h - 1, y))
+        return x, max(0, min(h, y))
     previous = None
     for n, value in points:
         if not xmin <= n <= xmax:
@@ -839,23 +837,23 @@ def braille_plot(points, width=32, height=4, errors=None):
         if previous is not None:
             dx, dy = current[0] - previous[0], current[1] - previous[1]
             steps = max(abs(dx), abs(dy))
-            for step in range(steps + 1):
-                fraction = step / steps if steps else 0
+            for segment in range(steps + 1):
+                fraction = segment / steps if steps else 0
                 pixels.add((round(previous[0] + dx * fraction), round(previous[1] + dy * fraction)))
         previous = current
     bits = ((1, 8), (2, 16), (4, 32), (64, 128))
     lines = []
-    for row in range(height):
+    for row in range(height + 1):
         cells = []
         for col in range(width):
             mask = sum(bits[dy][dx] for dy in range(4) for dx in range(2)
                        if (col * 2 + dx, row * 4 + dy) in pixels)
             cells.append(chr(0x2800 + mask) if mask else " ")
         lines.append("".join(cells))
-    return {"lines": lines, "labels": "".join(labels), "has_data": bool(known),
+    return {"lines": lines[:-1], "baseline": lines[-1], "labels": "".join(labels), "has_data": bool(known),
             "min_score": min((value for _, value in known), default=0), "max_score": max((value for _, value in known), default=0), "x_min": xmin, "x_max": xmax,
             "y_min": ymin, "y_max": ymax, "y_step": step, "x_axis": "concurrency (C, linear)",
-            "y_axis": "linear; 2-significant-digit bounds outside ±1 sample standard deviation",
+            "y_axis": "linear; 2-significant-digit bounds outside ±1 sample standard deviation; minimum clamped to zero",
             "points": [{"lanes": n, "score": value, "value": value, "stdev": errors.get(n)} for n, value in points]}
 
 
@@ -892,7 +890,8 @@ def chart_lines(plot, title, unit):
     for index, line in enumerate(plot["lines"]):
         tick = top if index == 0 else middle if index == len(plot["lines"]) // 2 else ""
         result.append(tick.rjust(gutter) + " │" + line)
-    result.append(bottom.rjust(gutter) + " └" + "─" * len(plot["lines"][0]))
+    baseline = "".join(dot if dot != " " else "─" for dot in plot["baseline"])
+    result.append(bottom.rjust(gutter) + " └" + baseline)
     result.append(" " * (gutter + 2) + plot["labels"])
     result.append(f"X: concurrency (C), {plot['x_min']}–{plot['x_max']}")
     return result

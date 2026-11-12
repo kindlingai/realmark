@@ -54,7 +54,8 @@ sanitized for filenames. `--output PATH` overrides the filename. The `.card.txt`
 contains the rendered result.
 Graph bars show ±1 sample SD: batch scores across repeats, otherwise task-rate
 variation; streaming-rate variation across requests. Missing SD is omitted.
-Y bounds round outward to two significant digits.
+Y bounds round outward to two significant digits, with the minimum clamped to zero.
+Points/error bars at that boundary overwrite the horizontal axis.
 
 The simulator is always correct and uses a discrete-event clock, with no real
 model waits. Prefill/decode capacities are shared across active requests per phase.
