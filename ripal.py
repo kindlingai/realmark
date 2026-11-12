@@ -310,85 +310,26 @@ def text_quality(expected, received):
             "similarity": 1 - distance / length if length else 1.0}
 
 
-class MixController:
-    def __init__(self, padding, enabled=True, history="auto", target=4.0, tolerance=.15):
-        self.padding = padding
-        self.enabled, self.history = enabled, history
-        self.target, self.tolerance = target, tolerance
-        self.fresh = self.output = 0
+class WordMixPlanner:
+    def __init__(self, initial_input=0, target=2.0, enabled=True, fixed_padding=0):
+        self.input_words, self.output_words = initial_input, 0.0
+        self.target, self.enabled = target, enabled
+        self.padding = fixed_padding
         self.events = []
-        self.maximum_padding = max(16384, padding)
 
-    def observe(self, mix, task):
-        if not mix.get("available") or not mix.get("output_tokens"):
-            return None
-        self.fresh += mix["fresh_tokens"]
-        self.output += mix["output_tokens"]
-        ratio = mix["fresh_per_output"]
-        cumulative = self.fresh / self.output
-        before = self.padding
-        outside = abs(ratio / self.target - 1) > self.tolerance or abs(cumulative / self.target - 1) > self.tolerance
-        if self.enabled and outside:
-            # Damped cumulative token debt, with a bounded step. This estimate is
-            # only for filler sizing; actual ratios always use server counters.
-            debt = self.target * self.output - self.fresh
-            step = round(.5 * debt / 1.3)
-            limit = max(256, before // 2)
-            self.padding = max(0, min(self.maximum_padding, before + max(-limit, min(limit, step))))
-        compact = self.history == "task" or (self.enabled and self.history == "auto" and (
-            mix["cached_tokens"] == 0 or ratio > self.target * (1 + self.tolerance)))
-        event = {"after_task": task, "task_ratio": ratio, "cumulative_ratio": cumulative,
-                 "padding_words": before, "next_padding_words": self.padding,
-                 "compact_history": compact,
-                 "floor_warning": before == 0 and ratio > self.target * (1 + self.tolerance),
-                 "reason": "no observed cache reuse" if compact and mix["cached_tokens"] == 0 else
-                           "prefill over budget" if compact else "padding feedback"}
+    def plan(self, expected, task):
+        inputs = sum(weighted_words(json.dumps(result)) for _, _, result in expected)
+        outputs = sum(weighted_words(json.dumps(arguments)) for _, arguments, _ in expected)
+        if self.enabled:
+            self.padding = max(0, round(self.target * (self.output_words + outputs) - self.input_words - inputs))
+        self.input_words += inputs + self.padding
+        self.output_words += outputs
+        event = {"after_task": task, "padding_words": self.padding, "next_padding_words": self.padding,
+                 "planned_input_words": inputs + self.padding, "planned_output_words": outputs,
+                 "cumulative_ratio": self.input_words / self.output_words,
+                 "compact_history": False, "basis": "expected visible weighted words"}
         self.events.append(event)
-        return event
-
-
-class GenerationController:
-    """Repay fresh/decode imbalance with source words, not just padding."""
-    def __init__(self, words=5, enabled=True, target=4.0):
-        self.words, self.enabled, self.target = words, enabled, target
-        self.minimum_words = max(1, min(5, words))
-        self.fresh = self.output = 0
-        self.events = []
-        self.tokens_per_word = 3.0
-
-    def observe(self, requests, words, padding_words, task):
-        if not requests or not all(r["tokens"].get("available") for r in requests):
-            return None
-        fresh = sum(r["tokens"]["fresh_tokens"] for r in requests)
-        output = sum(r["tokens"]["output_tokens"] for r in requests)
-        submit = next((r for r in reversed(requests) if r["stage"] == "submit_result"), None)
-        read = next((r for r in reversed(requests) if r["stage"] == "read_file"), None)
-        if not submit or not read or output <= 0:
-            return None
-        variable = max(1, submit["tokens"]["output_tokens"] - 32)
-        observed = max(1, variable / words)
-        self.tokens_per_word = observed
-        overhead = max(0, output - variable)
-        # The read result's prompt increment estimates input cost per extra
-        # source word, independent of cached-prefix accounting.
-        delta = submit["tokens"]["prompt_tokens"] - read["tokens"]["prompt_tokens"]
-        input_per_word = max(0, min(12, (delta - padding_words * 1.3 - 128) / words))
-        self.fresh += fresh
-        self.output += output
-        debt = self.fresh - self.target * self.output
-        baseline = max(0, fresh - input_per_word * words)
-        denominator = max(1, self.target * observed - input_per_word)
-        desired = max(self.minimum_words, round((baseline + .35 * debt - self.target * overhead) / denominator))
-        before = self.words
-        if self.enabled and (abs(fresh / output / self.target - 1) > .15 or
-                             abs(self.fresh / self.output / self.target - 1) > .15):
-            self.words = max(self.minimum_words, min(65536, max(round(words / 2), min(words * 16, desired))))
-        event = {"after_task": task, "source_words": words, "next_words": self.words,
-                 "task_ratio": fresh / output, "cumulative_ratio": self.fresh / self.output,
-                 "output_tokens_per_word": observed, "input_tokens_per_word": input_per_word,
-                 "previous_words": before}
-        self.events.append(event)
-        return event
+        return self.padding
 
 
 def read_stream(response, started, control=None, on_chunk=None):
@@ -622,7 +563,7 @@ class TerminalUI:
             self.lanes = {i: {"task": 0, "completed": 0, "finished": 0, "failures": 0, "stage": "ready", "status": "ready",
                               "since": time.perf_counter(), "calls": 0, "fresh": 0, "output": 0,
                               "accounted": True, "attempt": 1} for i in range(lanes)}
-        self.log(f"{phase} | {lanes} lane(s), {tasks} tasks/session, padding={padding} words")
+        self.log(f"{phase} | {lanes} lane(s), {tasks} tasks/session, word workload target 2:1")
 
     def stage_budget(self, seconds, control=None):
         with self.lock:
@@ -701,17 +642,21 @@ class TerminalUI:
         output = sum(s["output"] for _, s in lanes)
         known = all(s["accounted"] for _, s in lanes)
         ratio = f"{fresh / output:.2f}:1" if known and output else "pending/unknown"
+        planned_input = sum(s.get("planned_input", 0) for _, s in lanes)
+        planned_output = sum(s.get("planned_output", 0) for _, s in lanes)
+        word_ratio = f"{planned_input / planned_output:.2f}:1" if planned_output else "pending"
         spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(now * 8) % 10]
         budget_text = f"Stage left {format_duration(stage_deadline - now)} · " if stage_deadline is not None else ""
         if stage_control and stage_control.cutoff is not None and stage_control.drainers:
             budget_text = f"Draining task {stage_control.cutoff['task']} · "
         lines = [paint("RIPAL  /  local prefill + decode benchmark", "1;36"),
                  paint(f"{self.model}  ·  {self.endpoint}", "2"), "",
-                 paint(f"{phase}  ·  elapsed {format_duration(now - self.started)}  ·  initial padding {padding:,} words", "1"),
+                 paint(f"{phase}  ·  elapsed {format_duration(now - self.started)}  ·  word workload target 2:1", "1"),
                  paint(f"[{'━' * filled}{'─' * (24 - filled)}]  {finished}/{total} processed · {completed} passed · {failures} failed", "36"),
-                 paint(f"{budget_text}Batch tokens  fresh {fresh:,}  decode {output:,}  running ratio {ratio}  (target 4:1)", "2"), "",
+                 paint(f"{budget_text}Batch tokens  fresh {fresh:,}  decode {output:,}  running ratio {ratio}  (token diagnostic)", "2"), "",
+                 paint(f"Planned words  input {planned_input:,.1f}  output {planned_output:,.1f}  ratio {word_ratio}  (target 2:1)", "2"),
                  paint("LANE  TASK    TOOL / STATE                  REQUEST AGE    CALLS  FAILS  WORDS", "1;34")]
-        visible = max(1, height - 16)
+        visible = max(1, height - 17)
         for index, state in lanes[:visible]:
             waiting = state["status"] == "waiting"
             age = format_duration(now - state["since"]) if waiting else "—"
@@ -1093,7 +1038,7 @@ class FillerProgress:
         self.ui = ui
 
     def lane(self, index, **changes):
-        for key in ("task", "completed", "finished", "failures"):
+        for key in ("task", "completed", "finished", "failures", "planned_input", "planned_output"):
             changes.pop(key, None)
         if "stage" in changes:
             changes["stage"] = "filler/" + changes["stage"]
@@ -1289,7 +1234,6 @@ def stage_budget(warmups, workload, tasks, prefill_rate=1000):
     fresh_total, decode_seconds = 0, 0.0
     sources = set()
     for index, lane in enumerate(workload):
-        predicted_output = None
         warm = next((s for s in warmups if s['session'] == index), None)
         requests = warm.get('requests', []) if warm else []
         by_task = {}
@@ -1300,17 +1244,7 @@ def stage_budget(warmups, workload, tasks, prefill_rate=1000):
         completed = warm.get('load_completed_tasks', 0) if warm else 0
         complete_usage = completed and len(by_task) == completed and all(
             r.get('tokens', {}).get('available') for r in requests)
-        if complete_usage and warm.get('generation_adjustments'):
-            event = warm['generation_adjustments'][-1]
-            last = [r for r in requests if r['task'] == max(by_task)]
-            last_output = sum(r['tokens']['output_tokens'] for r in last)
-            words = event['source_words']
-            per_word = event['output_tokens_per_word']
-            overhead = max(0, last_output - per_word * words)
-            predicted_output = (per_word * warm['next_words'] + overhead) * tasks
-            fresh_total += 4 * predicted_output
-            sources.add('adaptive generation forecast at target 4:1')
-        elif complete_usage:
+        if complete_usage:
             values = [by_task[t] for t in sorted(by_task)]
             growth = max(0, (values[-1] - values[0]) / max(1, len(values) - 1))
             fresh_total += values[-1] * tasks + growth * tasks * (tasks + 1) / 2
@@ -1330,8 +1264,7 @@ def stage_budget(warmups, workload, tasks, prefill_rate=1000):
         if completed:
             samples = [(r.get('phase_timing') or {}).get('generation_seconds') for r in requests]
             if samples and all(value is not None and math.isfinite(value) for value in samples):
-                decode = (sum(samples) / sum(r["tokens"]["output_tokens"] for r in requests) * predicted_output
-                          if predicted_output is not None else sum(samples) / completed * tasks)
+                decode = sum(samples) / completed * tasks
             else:
                 decode = 0
                 sources.add('decode allowance unavailable without streaming timings')
@@ -1522,9 +1455,10 @@ def session_diagnostics(raw, transform):
     notes = []
     block_counts = []
     block_lanes = set()
+    tolerance = raw.get('config', {}).get('parameters', {}).get('ratio_tolerance', .15)
     for level, profile in raw.get('runs', {}).items():
         c = int(level.split('=')[1])
-        findings = {'loop': [], 'corruption': [], 'script': [], 'pressure': []}
+        findings = {'loop': [], 'corruption': [], 'script': [], 'pressure': [], 'wordmix': []}
         for lane in profile['lanes']:
             events = sorted([e for phase in ('run', 'partial') for e in lane['telemetry'][phase]],
                             key=lambda e: e['elapsed'])
@@ -1543,6 +1477,13 @@ def session_diagnostics(raw, transform):
                                 for k in ('name', 'arguments'))):
                         first_times[rid] = chunk['elapsed']
                         break
+            budgets = {}
+            for event in events:
+                if event['type'] == 'task_start' and event.get('word_budget'):
+                    budgets[event['session']] = event['word_budget']
+            for budget in budgets.values():
+                if abs(budget['cumulative_ratio'] / 2 - 1) > tolerance:
+                    findings['wordmix'].append((lane['lane'], budget['cumulative_ratio']))
             previous = None
             pressure = []
             for event in events:
@@ -1611,6 +1552,9 @@ def session_diagnostics(raw, transform):
                     findings['script'].append((ref, scripts.most_common(1)[0][0].lower()))
             if len(pressure) >= 2:
                 findings['pressure'].extend(pressure)
+        if findings['wordmix']:
+            details = ', '.join(f'L{lane} {ratio:.2f}:1' for lane, ratio in findings['wordmix'])
+            notes.append({'lanes': [c], 'columns': ['mix'], 'text': f'C={c} planned word mix outside the 2:1 reference ({details}). Fixed overhead or padding prevents the target; use more source words, fewer records, or enable word planning.'})
         if findings['loop']:
             details = '; '.join(f"{ref}: {loop['words']:,} words repeating a {loop['period']}-word motif" for ref, loop in findings['loop'])
             notes.append({'lanes': [c], 'columns': ['decode'], 'text': f'C={c} looping detected — {details}.'})
@@ -1850,8 +1794,8 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v11"
-TARGET_RATIO = 4.0
+VERSION = "ripal-v12"
+TARGET_RATIO = 2.0
 WORDS = """amber birch cedar delta ember fern garden harbor island jungle kettle lantern
 maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr
 acorn anchor apple apricot arrow autumn avocado azure badge bamboo banana barrel
@@ -1926,7 +1870,7 @@ TOOLS = [
 class Config:
     tasks: int = 8
     records: int = 2
-    words: int = 5
+    words: int = 256
     filler_words: int = 1536
     seed: int = 42
     max_tokens: int = 2048
@@ -1965,16 +1909,18 @@ def resize_task(task, config, words):
     transformation = task["transformation"]
     vocabulary = PIG_LATIN_WORDS if transformation == "pig_latin" else WORDS
     metadata = random.Random(task["record_seed"] + ":metadata")
+    metadata_records = [(f"record-{metadata.getrandbits(64):016x}", metadata.randrange(1, 1000))
+                        for _ in range(config.records)]
+    target_index = metadata.randrange(config.records)
     records = []
-    for index in range(config.records):
-        record_id = f"record-{metadata.getrandbits(64):016x}"
-        revision = metadata.randrange(1, 1000)
+    for index, (record_id, revision) in enumerate(metadata_records):
         rng = random.Random(task["record_seed"] + f":payload:{index}")
-        payload = rng.choices(vocabulary, k=words)
+        count = words if index == target_index else max(1, words // max(2, 2 * (config.records - 1)))
+        payload = rng.choices(vocabulary, k=count)
         if transformation == "invert_case":
             payload = [mixed_case(word, rng) for word in payload]
         records.append({"id": record_id, "revision": revision, "payload": " ".join(payload)})
-    task.update(target=records[metadata.randrange(len(records))], words=words,
+    task.update(target=records[target_index], words=words,
                 contents="\n".join(json.dumps(record) for record in records))
     return task
 
@@ -2003,7 +1949,10 @@ def request_tokens(response, cache_policy="server-default"):
     def count(value):
         return isinstance(value, int) and not isinstance(value, bool) and value >= 0
     if not all(count(value) for value in (prompt, output, cached)) or cached > prompt:
-        return {"available": False, "requests": 1, "reason": "Missing or invalid prompt/completion/cached token counters"}
+        return {"available": False, "requests": 1,
+                "prompt_tokens": prompt if count(prompt) else None,
+                "output_tokens": output if count(output) else None,
+                "reason": "Missing or invalid prompt/completion/cached token counters"}
     return {"available": True, "requests": 1, "prompt_tokens": prompt,
             "cached_tokens": cached, "fresh_tokens": prompt - cached, "output_tokens": output}
 
@@ -2021,8 +1970,8 @@ def token_mix(items):
 
 
 def mix_matches(mix, target, tolerance):
-    ratio = mix.get("fresh_per_output")
-    return mix.get("available", False) and ratio is not None and abs(ratio / target - 1) <= tolerance
+    ratio = mix.get("input_per_output")
+    return ratio is not None and abs(ratio / target - 1) <= tolerance
 
 
 def emit(client, message, final=False):
@@ -2176,13 +2125,13 @@ def run_session(client, config, tasks, session, state=None):
     context_reason = None
     ui = getattr(client, "progress", None)
     control = getattr(client, "control", None)
-    mix_control = MixController(state.get("padding", config.filler_words), config.adaptive_mix, config.history_mode,
-                                TARGET_RATIO, getattr(client, "ratio_tolerance", .15))
+    initial_input = sum(weighted_words(m.get("content")) for m in (messages[-1:] if continued else messages)
+                        if m.get("role") != "assistant")
+    mix_control = WordMixPlanner(initial_input, TARGET_RATIO, config.adaptive_mix, config.filler_words)
     output_reserve = int(getattr(client, "extra", {}).get("max_completion_tokens", getattr(client, "extra", {}).get("max_tokens", config.max_tokens)))
     budget = state.get("budget") or ContextBudget(client, TOOLS, output_reserve)
     budget.client = client
     gate = getattr(client, "task_gate", None)
-    generation = GenerationController(state.get("words", config.words), config.adaptive_mix)
     compact_before = False
     try:
         if state.get("context_reason"):
@@ -2194,7 +2143,7 @@ def run_session(client, config, tasks, session, state=None):
                 control.check()
             task_ok, aborted = True, False
             dependency_ok, quality_credit, edit = True, 0.0, None
-            resize_task(task, config, generation.words)
+            resize_task(task, config, config.words)
             target = task["target"]
             words = task["words"]
             transformation = task["transformation"]
@@ -2202,27 +2151,31 @@ def run_session(client, config, tasks, session, state=None):
                 messages = [{"role": "system", "content": SYSTEM},
                             {"role": "user", "content": f"Start with task ID {target['id']}."}]
                 trace.emit(sid, phase, "history_reset", task=index + 1, messages=list(messages))
-            padding_words = mix_control.padding
-            padding = task["read_padding"] if padding_words == config.filler_words else " ".join(
-                random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
             expected_text = transform(target["payload"], transformation)
+            next_id = tasks[index + 1]["target"]["id"] if index + 1 < len(tasks) else None
+            expected = [
+                ("search_records", {"id": target["id"]}, {"path": task["path"]}),
+                ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": "",
+                 "transformation": transformation, "instructions": task["instructions"]}),
+                ("submit_result", {"id": target["id"], "revision": target["revision"], "text": expected_text},
+                 {"ok": True, "next_task_id": next_id}),
+            ]
+            if compact_before:
+                mix_control.input_words += sum(weighted_words(m.get("content")) for m in messages)
+            padding_words = mix_control.plan(expected, index + 1)
+            padding = " ".join(random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
+            expected[1][2]["read_padding"] = padding
             task_config = replace(config, words=words, max_tokens=max(config.max_tokens, len(expected_text.encode()) + 256))
             extra = getattr(client, "extra", {})
             budget.output_tokens = int(extra.get("max_completion_tokens", extra.get("max_tokens", task_config.max_tokens)))
             budget.check_task(messages, task, padding)
             attempted += 1
-            trace.emit(sid, phase, "task_start", task=index + 1, fixture={**task, "read_padding": padding}, padding=padding)
+            trace.emit(sid, phase, "task_start", task=index + 1, fixture={**task, "read_padding": padding}, padding=padding,
+                       word_budget=mix_control.events[-1])
             task_request_start = len(requests)
             if ui:
-                ui.lane(session, padding=padding_words, words=words)
-            next_id = tasks[index + 1]["target"]["id"] if index + 1 < len(tasks) else None
-            expected = [
-                ("search_records", {"id": target["id"]}, {"path": task["path"]}),
-                ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding,
-                 "transformation": transformation, "instructions": task["instructions"]}),
-                ("submit_result", {"id": target["id"], "revision": target["revision"], "text": expected_text},
-                 {"ok": True, "next_task_id": next_id}),
-            ]
+                ui.lane(session, padding=padding_words, words=words, planned_input=mix_control.input_words,
+                        planned_output=mix_control.output_words)
             for stage, arguments, result in expected:
                 for attempt in range(config.retries + 1):
                     if control:
@@ -2390,18 +2343,9 @@ def run_session(client, config, tasks, session, state=None):
                                  "text_quality": edit, "finished_seconds": time.perf_counter() - started})
             if gate:
                 gate.complete(index + 1)
-            event = mix_control.observe(token_mix(r["tokens"] for r in requests[task_request_start:]), index + 1)
-            gen_event = generation.observe(requests[task_request_start:], words, padding_words, index + 1)
-            if gen_event and generation.words != words:
-                emit(client, f"WORDS lane {session + 1}: {words} -> {generation.words}; "
-                     f"fresh/decode {gen_event['cumulative_ratio']:.2f}:1")
-            compact_before = config.history_mode == "task" or bool(event and event["compact_history"])
-            if event and index + 1 < len(tasks) and (event["next_padding_words"] != padding_words or compact_before):
-                emit(client, f"MIX lane {session + 1}: ratio {event['cumulative_ratio']:.2f}:1; "
-                     f"next padding {padding_words} -> {event['next_padding_words']}; "
-                     f"history {'compacted' if compact_before else 'retained'} ({event['reason']})")
+            compact_before = config.history_mode == "task"
             trace.emit(sid, phase, "task_end", task=index + 1, status="aborted" if aborted else "finished",
-                       next_parameters={"words": generation.words, "padding": mix_control.padding})
+                       next_parameters={"words": config.words, "padding": mix_control.padding})
             if aborted and next_id:
                 messages.append({"role": "user", "content": f"Continue with task ID {next_id}."})
                 trace.emit(sid, phase, "messages", task=index + 1, messages=messages[-1:])
@@ -2429,7 +2373,7 @@ def run_session(client, config, tasks, session, state=None):
     trace.emit(sid, phase, "session_end", stop={"kind": control.kind if control and control.stopped else
                "stage_time_limit" if time_limited else "context_limit" if context_limited else "error" if error else None,
                "reason": context_reason or error or (control.reason if control and control.stopped else None)})
-    state.update({"trace": trace, "sid": sid, "messages": messages, "padding": mix_control.padding, "budget": budget, "context_reason": context_reason, "words": generation.words})
+    state.update({"trace": trace, "sid": sid, "messages": messages, "padding": mix_control.padding, "budget": budget, "context_reason": context_reason, "words": config.words})
     return {"session": session, "telemetry": trace.events, "telemetry_session": sid,
             "word_mix": word_mix(trace.events, sid), "seconds": time.perf_counter() - started, "planned_tasks": len(tasks),
             "attempted_tasks": attempted, "completed_tasks": completed,
@@ -2441,7 +2385,7 @@ def run_session(client, config, tasks, session, state=None):
             "load_completed_tasks": exercised, "task_results": task_results,
             "load_completed_words": sum(t["load_words"] for t in task_results if t["load_completed"]),
             "quality_word_credit": sum(t["quality_credit"] * t["load_words"] for t in task_results),
-            "generation_adjustments": generation.events, "next_words": generation.words,
+            "generation_adjustments": [], "next_words": config.words,
             "mix_adjustments": mix_control.events,
             "quality_credit": sum(task["quality_credit"] for task in task_results),
             "calls": calls, "retries": retries,
@@ -2492,7 +2436,7 @@ def split_budget_tail(session, limit):
     core = subset(core_requests, core_results, session["planned_tasks"], min(session["attempted_tasks"], limit))
     core["time_limited"] = True
     core["context_skipped_tasks"] = min(core.get("context_skipped_tasks", 0), core["unfinished_tasks"])
-    core["next_words"] = core["generation_adjustments"][-1]["next_words"] if core["generation_adjustments"] else 5
+    core["next_words"] = core["generation_adjustments"][-1]["next_words"] if core["generation_adjustments"] else session["next_words"]
     tail = subset(tail_requests, tail_results, max(0, session["attempted_tasks"] - limit),
                   max(0, session["attempted_tasks"] - limit), tail=True)
     return core, tail
@@ -2567,7 +2511,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             while not finished.is_set() and not stage_control.stopped and not stage_control.expired:
                 seed = int.from_bytes(hashlib.sha256(f"{config.seed}:filler:{index}:{sequence}".encode()).digest()[:8], "big")
                 filler_config = replace(config, seed=seed, tasks=1, filler=False, filler_words=padding, words=filler_words)
-                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index)
+                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index, state=state)
                 item.update({"filler": True, "seed": seed})
                 filler_words = item["next_words"]
                 if item["mix_adjustments"]:
@@ -2634,57 +2578,6 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             "mix_excludes_cancelled_filler_usage": any(s["cancelled_requests"] for s in filler_sessions)}
 
 
-def calibrate_mix(client, config, target=4.0, tolerance=.15, max_rounds=6):
-    """Untimed pilot sessions adjust padding only; freeze the resulting config."""
-    rounds = []
-    current = config
-    previous = None
-    for index in range(max_rounds):
-        if stop_requested(client):
-            return current, {"valid": False, "interrupted": True, "error": "Interrupted during calibration", "rounds": rounds}
-        seed = int.from_bytes(hashlib.sha256(f"{config.seed}:calibration:{index}".encode()).digest()[:8], "big")
-        pilot_config = replace(current, seed=seed)
-        ui = getattr(client, "progress", None)
-        if ui:
-            ui.begin(f"Calibration {index + 1}/{max_rounds}", 1, config.tasks, current.filler_words)
-        pilot = run_session(client, pilot_config, make_session(pilot_config, 0), 0)
-        mix = pilot["token_mix"]
-        rounds.append({"round": index + 1, "seed": seed, "filler_words": current.filler_words,
-                       "session": pilot})
-        if pilot["interrupted"] or stop_requested(client):
-            reason = getattr(getattr(client, "control", None), "reason", None) or "Interrupted"
-            return current, {"valid": False, "interrupted": True, "error": f"Calibration stopped: {reason}", "rounds": rounds}
-        ratio = mix.get("fresh_per_output")
-        ratio_text = f"{ratio:.2f}:1" if ratio is not None else "unknown"
-        status = "FAILED (partial token mix)" if pilot["error"] else "complete"
-        emit(client, f"Calibration {index + 1} {status}: {pilot['completed_tasks']}/{config.tasks} tasks; "
-             f"padding={current.filler_words}; fresh/output={ratio_text}")
-        if pilot["error"]:
-            return current, {"valid": False, "error": pilot["error"], "rounds": rounds}
-        if not mix["available"] or not mix["output_tokens"]:
-            return current, {"valid": False, "error": "Fresh/output usage counters required for calibration. "
-                            "Declare --cache-policy disabled only if caching is actually off.", "rounds": rounds}
-        if mix_matches(mix, target, tolerance):
-            return current, {"valid": True, "rounds": rounds}
-        if current.filler_words == 0 and mix["fresh_per_output"] > target * (1 + tolerance):
-            return current, {"valid": False, "error": "Base workload exceeds target with zero padding. "
-                            "Try fewer --records/--tasks, more --words, or enable server prefix caching.", "rounds": rounds}
-        if index + 1 == max_rounds:
-            break
-        tokens_per_word_per_task = 1.3  # first probe only; later use measured slope
-        if previous and current.filler_words != previous[0]:
-            slope = (mix["fresh_tokens"] - previous[1]) / (current.filler_words - previous[0]) / config.tasks
-            if slope > .1:
-                tokens_per_word_per_task = slope
-        delta = (target * mix["output_tokens"] - mix["fresh_tokens"]) / (config.tasks * tokens_per_word_per_task)
-        next_padding = max(0, round(current.filler_words + delta))
-        if next_padding == current.filler_words:
-            next_padding = max(0, current.filler_words + (1 if delta > 0 else -1))
-        previous = (current.filler_words, mix["fresh_tokens"])
-        current = replace(current, filler_words=next_padding)
-    return current, {"valid": False, "error": "Token mix did not converge; inspect calibration rounds.", "rounds": rounds}
-
-
 def score(sessions, seconds):
     if sessions <= 0:
         return 0.0
@@ -2735,7 +2628,7 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
     stdev = statistics.stdev(times) if len(times) > 1 else None
     correct = warmup_valid and all(run["valid"] for run in runs)
     mix = token_mix(run.get("token_mix", {"available": False}) for run in runs)
-    mix_valid = mix_matches(mix, target_ratio, ratio_tolerance) if target_ratio is not None else None
+    mix_valid = mix_matches(combine_word_mix(run.get("word_mix", {}) for run in runs), target_ratio, ratio_tolerance) if target_ratio is not None else None
     interrupted = any(run.get("interrupted", False) for run in runs)
     valid = correct and (mix_valid is not False) and not interrupted
     credits = [run.get("effective_sessions", lanes if run["valid"] else 0) for run in runs]
@@ -2844,19 +2737,17 @@ def main():
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
     parser.add_argument("--repeats", type=positive, default=1)
     parser.add_argument("--warmup-tasks", dest="warmup_tasks", type=int, default=2,
-                        help="Unscored tasks at the start of each session (default 2; also tunes the token mix).")
+                        help="Unscored tasks at the start of each session (default 2; excluded from measured statistics).")
     parser.add_argument("--bootstrap-samples", type=positive, default=5000)
-    parser.add_argument("--calibration-rounds", type=int, default=0,
-                        help="Optional extra calibration prepass; default 0 uses warmup tasks")
     parser.add_argument("--ratio-tolerance", type=float, default=.15,
-                        help="Relative tolerance around 4:1, default ±15%%")
+                        help="Relative tolerance around the 2:1 visible-word ratio, default ±15%%")
     parser.add_argument("--filler-words", type=int, default=Config().filler_words)
     parser.add_argument("--context-window", type=positive,
                         help="Context limit override if /models does not advertise it; lower limits are allowed")
     parser.add_argument("--no-filler", dest="filler", action="store_false",
                         help="Let early-finishing lanes idle instead of running tail filler tasks")
     parser.add_argument("--fixed-mix", dest="adaptive_mix", action="store_false",
-                        help="Disable runtime padding and generation-size feedback (enabled by default)")
+                        help="Use fixed --words and --filler-words instead of planning 2:1 word padding")
     parser.add_argument("--history", dest="history_mode", choices=["auto", "full", "task"], default=Config().history_mode,
                         help="full retains warmup + test history (default); auto/task permit compaction")
     parser.add_argument("--cache-policy", choices=["server-default", "enabled", "disabled"], default="server-default",
@@ -2871,7 +2762,7 @@ def main():
     parser.add_argument("--stage-timeout", type=float,
                         help="Override measured-stage seconds; 0 disables the cap; default calibrates from warmups")
     parser.add_argument("--words", type=positive, default=Config().words,
-                        help="Initial source words per task (default 5); adaptive feedback changes subsequent tasks")
+                        help="Fixed source words per task (default 256); thinking and tokenization do not change it")
     parser.add_argument("--max-tokens", type=positive, default=Config().max_tokens,
                         help="Initial response token budget; grows to accommodate requested transformations")
     for name in ("records",):
@@ -2892,6 +2783,7 @@ def main():
     parser.add_argument("--output", type=Path,
                         help="Results filename (default realmark-MODEL.json)")
     args = parser.parse_args()
+    args.target_input_words_per_output = TARGET_RATIO
     if args.render:
         try:
             return render_saved_report(args)
@@ -2899,7 +2791,7 @@ def main():
             parser.error(f"Could not render {args.render}: {exc}")
     if args.card_output:
         parser.error("--card-output requires --render")
-    if args.retries < 0 or args.warmup_tasks < 0 or args.calibration_rounds < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+    if args.retries < 0 or args.warmup_tasks < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("retries and warmup-tasks must be nonnegative; timeout must be positive and finite")
     if args.filler_words < 0 or not math.isfinite(args.ratio_tolerance) or not 0 < args.ratio_tolerance < 1:
         parser.error("filler-words must be nonnegative and ratio-tolerance must be between 0 and 1")
@@ -3002,29 +2894,7 @@ def run_benchmark(args, client, config):
                   "scores": {}, "summaries": {}, "runs": [], "warmup_runs": []}
         write_results(args, client, report)
         return client.control.exit_code if stop_requested(client) else 2
-    calibration = {"source": "warmup_tasks", "skipped": args.warmup_tasks == 0, "valid": False, "rounds": [], "warmup_profiles": []}
-    if args.calibration_rounds:
-        config, calibration = calibrate_mix(client, config, TARGET_RATIO,
-                                           args.ratio_tolerance, args.calibration_rounds)
-        if not calibration["valid"] and args.strict and not stop_requested(client):
-            report = {"version": VERSION, "model": args.model, "base_url": args.base_url,
-                      "requested_config": asdict(requested_config), "config": asdict(config),
-                      "cache_policy": args.cache_policy, "calibration": calibration,
-                      "target_fresh_per_output": TARGET_RATIO, "ratio_tolerance": args.ratio_tolerance,
-                      "scores": {}, "geometric_mean_score": None, "runs": [], "warmup_runs": []}
-            emit(client, f"Calibration failed: {calibration['error']}", final=True)
-            write_results(args, client, report)
-            return 1
-        if not calibration["valid"]:
-            # Choose the closest observed usable token mix; do not use an untested adjustment.
-            candidates = [r for r in calibration["rounds"] if r["session"]["token_mix"].get("fresh_per_output") is not None]
-            if candidates:
-                best = min(candidates, key=lambda r: abs(r["session"]["token_mix"]["fresh_per_output"] - TARGET_RATIO))
-                config = replace(config, filler_words=best["filler_words"])
-            if stop_requested(client):
-                emit(client, "Interrupted. Preparing partial results.")
-            else:
-                emit(client, f"Calibration warning: {calibration['error']}; continuing and reporting the measured mix.")
+    calibration = {"source": "deterministic_word_plan", "skipped": args.warmup_tasks == 0, "valid": False, "rounds": [], "warmup_profiles": []}
     runs = []
     warmups = []
     profile_padding = {lanes: config.filler_words for lanes in args.lanes}
@@ -3073,8 +2943,8 @@ def run_benchmark(args, client, config):
                             "seconds": run["warmup_seconds"], "tasks_per_session": args.warmup_tasks,
                             "valid": all(session["completed_tasks"] == args.warmup_tasks for session in warm_sessions),
                             "token_mix": warm_mix, "seed": batch_seed})
-            calibration.setdefault("warmup_profiles", []).append({"lanes": lanes, "token_mix": warm_mix})
-            calibration["valid"] = all(mix_matches(p["token_mix"], TARGET_RATIO, args.ratio_tolerance)
+            calibration.setdefault("warmup_profiles", []).append({"lanes": lanes, "word_mix": combine_word_mix(s["word_mix"] for s in warm_sessions)})
+            calibration["valid"] = all(mix_matches(p["word_mix"], TARGET_RATIO, args.ratio_tolerance)
                                         for p in calibration["warmup_profiles"])
         run["seed"] = batch_seed
         run["workload_sha256"] = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
@@ -3098,7 +2968,7 @@ def run_benchmark(args, client, config):
         cv = f"{100 * summary['timing_cv']:.1f}%" if summary["timing_cv"] is not None else "unavailable"
         emit(client, f"{summary['profile']}: {points} points; 95% CI {confidence}; "
               f"time {format_duration(summary['mean_seconds'])} ± {deviation}; CV {cv}; "
-              f"fresh/output={summary['token_mix'].get('fresh_per_output')}; mix_valid={summary['mix_valid']}")
+              f"input/output words={summary['word_mix'].get('input_per_output')}; mix_valid={summary['mix_valid']}")
     scores = {lanes: summary["score"] for lanes, summary in summaries.items()}
     aggregate = (0.0 if any(value == 0 for value in scores.values()) else
                  math.exp(statistics.mean(math.log(value) for value in scores.values()))) if scores and all(
@@ -3116,7 +2986,7 @@ def run_benchmark(args, client, config):
               "pig_latin_vocabulary_words": len(PIG_LATIN_WORDS),
               "model_context": context_info,
               "requested_config": asdict(requested_config), "calibration": calibration,
-              "target_fresh_per_output": TARGET_RATIO, "ratio_tolerance": args.ratio_tolerance,
+              "target_input_words_per_output": TARGET_RATIO, "ratio_tolerance": args.ratio_tolerance,
               "measurement": {"warmup_tasks_per_lane": args.warmup_tasks,
                               "warmups_in_same_session": True, "repeats": args.repeats,
                               "bootstrap_samples": args.bootstrap_samples, "session_count": "equals lanes",
@@ -3129,7 +2999,7 @@ def run_benchmark(args, client, config):
                               "max_completed_response_seconds_by_lanes": profile_maxima,
                               "max_response_source_words_by_lanes": profile_response_words,
                               "response_deadline_scaling": "submit_result scales up with source words relative to previous profile maximum; initial reference 256 words",
-                              "mix_control": "adaptive" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
+                              "mix_control": "expected-word padding" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
                               "seed_policy": "SHA256(base_seed:session:repeat:lanes), warmup and measured task histories concatenated"},
               "score_formula": "1000 * asinh((completed_weighted_words / measured_seconds) / 10) / asinh(1)",
               "score_work_unit_words": SCORE_WORDS,
