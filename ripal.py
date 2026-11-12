@@ -4,6 +4,7 @@
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -17,6 +18,7 @@ import queue
 import random
 import shutil
 import signal
+import socket
 import statistics
 import sys
 import threading
@@ -37,6 +39,37 @@ class RunControl:
         self.stop = threading.Event()
         self.kind = None
         self.reason = None
+        self.init_responses()
+
+    def init_responses(self):
+        self.response_lock = threading.Lock()
+        self.response_sockets = set()
+
+    @contextmanager
+    def watch_response(self, response):
+        # urllib's HTTPResponse wraps a SocketIO (also for HTTPS). Shutting down
+        # that socket unblocks a read waiting for the first SSE token. Merely
+        # closing the buffered reader from another thread can block on its lock.
+        sock = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
+        if sock is not None:
+            with self.response_lock:
+                self.response_sockets.add(sock)
+        try:
+            self.check()
+            yield
+        finally:
+            if sock is not None:
+                with self.response_lock:
+                    self.response_sockets.discard(sock)
+
+    def abort_responses(self):
+        with self.response_lock:
+            sockets = list(self.response_sockets)
+        for sock in sockets:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     @property
     def stopped(self):
@@ -57,6 +90,7 @@ class RunControl:
 
     def check(self):
         if self.stopped:
+            self.abort_responses()
             raise RunCancelled(self.reason or "Run stopped")
 
     def call(self, operation, timeout=60, label="tool call"):
@@ -105,6 +139,7 @@ class RunControl:
 class FillerControl(RunControl):
     def __init__(self, parent, finished):
         self.parent, self.finished = parent, finished
+        self.init_responses()
 
     @property
     def stopped(self):
@@ -117,6 +152,40 @@ class FillerControl(RunControl):
     @property
     def reason(self):
         return self.parent.reason or "All primary lanes completed"
+
+    def terminate(self, kind, reason):
+        self.parent.terminate(kind, reason)
+
+
+class StageControl(RunControl):
+    """A measured-stage budget stops local work without stopping the suite."""
+    def __init__(self, parent):
+        self.parent = parent
+        self.init_responses()
+        self.deadline = None
+        self.seconds = None
+
+    def start(self, seconds):
+        self.seconds = seconds
+        self.deadline = time.perf_counter() + seconds if seconds else None
+
+    @property
+    def expired(self):
+        return self.deadline is not None and time.perf_counter() >= self.deadline
+
+    @property
+    def stopped(self):
+        return self.parent.stopped or self.expired
+
+    @property
+    def kind(self):
+        return self.parent.kind if self.parent.stopped else 'stage_time_limit' if self.expired else None
+
+    @property
+    def reason(self):
+        if self.parent.stopped:
+            return self.parent.reason
+        return f'Measured stage reached its {self.seconds:g}s time budget' if self.expired else None
 
     def terminate(self, kind, reason):
         self.parent.terminate(kind, reason)
@@ -360,6 +429,7 @@ class TerminalUI:
         self.events = deque(maxlen=50)
         self.finals = []
         self.padding = 0
+        self.stage_deadline = None
 
     def __enter__(self):
         if self.live:
@@ -386,10 +456,15 @@ class TerminalUI:
     def begin(self, phase, lanes, tasks, padding):
         with self.lock:
             self.phase, self.tasks, self.padding = phase, tasks, padding
+            self.stage_deadline = None
             self.lanes = {i: {"task": 0, "completed": 0, "finished": 0, "failures": 0, "stage": "ready", "status": "ready",
                               "since": time.perf_counter(), "calls": 0, "fresh": 0, "output": 0,
                               "accounted": True, "attempt": 1} for i in range(lanes)}
         self.log(f"{phase} | {lanes} lane(s), {tasks} tasks/session, padding={padding} words")
+
+    def stage_budget(self, seconds):
+        with self.lock:
+            self.stage_deadline = time.perf_counter() + seconds if seconds else None
 
     def lane(self, index, **changes):
         with self.lock:
@@ -449,6 +524,7 @@ class TerminalUI:
             lanes = [(i, dict(state)) for i, state in self.lanes.items()]
             phase, tasks, padding = self.phase, self.tasks, self.padding
             events = list(self.events)[-4:]
+            stage_deadline = self.stage_deadline
         def paint(text, code="0"):
             text = safe_text(text)[:max(1, width - 1)]
             return f"\x1b[{BACKGROUND};{STYLES.get(code, CREAM)}m{text.ljust(width - 1)}\x1b[0m" if self.color else text
@@ -462,11 +538,12 @@ class TerminalUI:
         known = all(s["accounted"] for _, s in lanes)
         ratio = f"{fresh / output:.2f}:1" if known and output else "pending/unknown"
         spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(now * 8) % 10]
+        budget_text = f"Stage left {max(0, stage_deadline - now):.1f}s · " if stage_deadline is not None else ""
         lines = [paint("RIPAL  /  local prefill + decode benchmark", "1;36"),
                  paint(f"{self.model}  ·  {self.endpoint}", "2"), "",
                  paint(f"{phase}  ·  elapsed {now - self.started:.1f}s  ·  initial padding {padding:,} words", "1"),
                  paint(f"[{'━' * filled}{'─' * (24 - filled)}]  {finished}/{total} processed · {completed} passed · {failures} failed", "36"),
-                 paint(f"Batch tokens  fresh {fresh:,}  decode {output:,}  running ratio {ratio}  (target 4:1)", "2"), "",
+                 paint(f"{budget_text}Batch tokens  fresh {fresh:,}  decode {output:,}  running ratio {ratio}  (target 4:1)", "2"), "",
                  paint("LANE  TASK    TOOL / STATE                  REQUEST AGE    CALLS  FAILS   PAD", "1;34")]
         visible = max(1, height - 16)
         for index, state in lanes[:visible]:
@@ -673,7 +750,9 @@ def result_card(report, width=98):
             (f"  {summary.get('api_errors', 0):>10}" if show_api_errors else "") + f"  {mix:>9}")
     add()
     if summaries:
-        add("C    Prefill~ total (each)    Decode~ total (each)    Complete s   Batch s")
+        estimated = any(summary.get("time_limited") for _, summary in summaries)
+        add("C    Prefill~ total (each)    Decode~ total (each)   " +
+            ("Complete~ s  Batch~ s" if estimated else " Complete s   Batch s"))
         for lanes, summary in summaries:
             phases = summary.get("phase_averages", {})
             def metric(value):
@@ -684,8 +763,8 @@ def result_card(report, width=98):
                 return f"{total:,.1f} ({each:,.1f})" if each is not None and total is not None else "—"
             add(f"{int(lanes):>2}L {rate('prefill_tokens_per_second'):>23} "
                 f"{rate('decode_tokens_per_second'):>24} "
-                f"{metric(phases.get('average_completion_seconds')):>12} "
-                f"{metric(summary.get('mean_seconds')):>9}")
+                f"{metric(summary.get('average_estimated_completion_seconds') if summary.get('time_limited') else phases.get('average_completion_seconds')):>12} "
+                f"{metric(summary.get('estimated_full_seconds') if summary.get('time_limited') else summary.get('mean_seconds')):>9}")
         add()
         plot = report.get("score_plot") or braille_plot([(int(n), s["score"]) for n, s in summaries])
         for line in chart_lines(plot, "Load score", "points"):
@@ -704,6 +783,11 @@ def result_card(report, width=98):
     if calibration.get("error"):
         add("Calibration: " + calibration["error"])
     for lanes, summary in summaries:
+        if summary.get("time_limited"):
+            elapsed = summary.get("mean_seconds", 0)
+            projected = summary.get("estimated_full_seconds")
+            estimate = f"{projected:.1f}s projected full batch" if projected is not None else "no completed tasks to project"
+            add(f"{lanes}L time cap: {elapsed:.1f}s observed; {estimate}.")
         if summary.get("context_limited_sessions"):
             add(f"{lanes}L context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
@@ -793,6 +877,19 @@ class PhaseClient:
         return getattr(self.client, name)
 
 
+class StageClient:
+    def __init__(self, client, control):
+        self.client, self.control = client, control
+
+    def __getattr__(self, name):
+        return getattr(self.client, name)
+
+    def complete(self, messages, stage, config, cancel_control=None):
+        if getattr(self.client, 'supports_stream_cancel', False):
+            return self.client.complete(messages, stage, config, cancel_control=cancel_control or self.control)
+        return self.client.complete(messages, stage, config)
+
+
 class ContextLimitReached(Exception):
     pass
 
@@ -865,7 +962,82 @@ class ContextBudget:
                 "peak_reserved_context": self.peak_reserved}
 
 
-VERSION = "ripal-v8"
+DEFAULT_TASK_SCHEDULE = [(1, 16), (2, 8), (4, 4)]
+SCORE_TASKS = 8
+
+
+def schedule_entry(value):
+    try:
+        concurrency, tasks = (int(part) for part in value.split(':'))
+        if concurrency < 1 or tasks < 1:
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError('use C:TASKS with positive integers, e.g. 1:16') from None
+    return concurrency, tasks
+
+
+def tasks_for_lanes(lanes, schedule):
+    if len({level for level, _ in schedule}) != len(schedule):
+        raise ValueError('task schedule has duplicate concurrency thresholds')
+    eligible = [(level, count) for level, count in schedule if level <= lanes]
+    if not eligible:
+        raise ValueError(f'task schedule has no entry for concurrency {lanes}')
+    return max(eligible)[1]
+
+
+def stage_budget(warmups, workload, tasks, prefill_rate=1000):
+    """Forecast fresh input growth and allow observed decode time in parallel."""
+    fresh_total, decode_seconds = 0, 0.0
+    sources = set()
+    for index, lane in enumerate(workload):
+        warm = next((s for s in warmups if s['session'] == index), None)
+        requests = warm.get('requests', []) if warm else []
+        by_task = {}
+        for request in requests:
+            tokens = request.get('tokens', {})
+            if tokens.get('available'):
+                by_task[request['task']] = by_task.get(request['task'], 0) + tokens['fresh_tokens']
+        completed = warm.get('load_completed_tasks', 0) if warm else 0
+        complete_usage = completed and len(by_task) == completed and all(
+            r.get('tokens', {}).get('available') for r in requests)
+        if complete_usage:
+            values = [by_task[t] for t in sorted(by_task)]
+            growth = max(0, (values[-1] - values[0]) / max(1, len(values) - 1))
+            fresh_total += values[-1] * tasks + growth * tasks * (tasks + 1) / 2
+            sources.add('warmup fresh tokens with observed per-task growth')
+        else:
+            # Without usable warmup counters, conservatively model uncached history
+            # growing through each full three-request tool cycle. No answers leave
+            # the harness, and tokenization calls are not generation work.
+            history = 512
+            for task in lane[-tasks:]:
+                data = len(json.dumps({'contents': task['contents'], 'read_padding': task['read_padding'],
+                                       'instructions': task['instructions']})) / 3
+                output = len(task['target']['payload']) / 2 + 96
+                fresh_total += 3 * history + data + 128
+                history += data + output + 128
+            sources.add('uncached text-size forecast (warmup usage unavailable)')
+        if completed:
+            samples = [(r.get('phase_timing') or {}).get('generation_seconds') for r in requests]
+            if samples and all(value is not None and math.isfinite(value) for value in samples):
+                decode = sum(samples) / completed * tasks
+            else:
+                decode = 0
+                sources.add('decode allowance unavailable without streaming timings')
+            decode_seconds = max(decode_seconds, decode)
+    raw_seconds = fresh_total / prefill_rate + decode_seconds
+    seconds = max(60, math.ceil(raw_seconds / 60) * 60)
+    return {'seconds': seconds, 'estimated_fresh_tokens': round(fresh_total),
+            'prefill_floor_tokens_per_second': prefill_rate,
+            'decode_allowance_seconds': decode_seconds, 'unrounded_seconds': raw_seconds,
+            'source': '; '.join(sorted(sources)), 'rounding': 'up to whole minutes'}
+
+
+def extrapolate_seconds(seconds, completed, planned):
+    return seconds * planned / completed if completed > 0 else None
+
+
+VERSION = "ripal-v9"
 TARGET_RATIO = 4.0
 WORDS = """amber birch cedar delta ember fern garden harbor island jungle kettle lantern
 maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr
@@ -1139,10 +1311,12 @@ class Client:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(self.url, json.dumps(body).encode(), headers)
         started = time.perf_counter()
+        control = cancel_control or getattr(self, "control", None)
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
-            if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
-                return read_stream(response, started, cancel_control or getattr(self, "control", None))
-            return json.load(response)
+            with control.watch_response(response) if control else nullcontext():
+                if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
+                    return read_stream(response, started, control)
+                return json.load(response)
 
 
 def run_session(client, config, tasks, session, state=None):
@@ -1157,6 +1331,7 @@ def run_session(client, config, tasks, session, state=None):
     error = None
     interrupted = False
     context_limited = False
+    time_limited = False
     context_reason = None
     ui = getattr(client, "progress", None)
     control = getattr(client, "control", None)
@@ -1350,7 +1525,8 @@ def run_session(client, config, tasks, session, state=None):
         context_reason = str(exc)
         emit(client, f"CONTEXT lane {session + 1}: {context_reason}; no further tasks added")
     except RunCancelled:
-        interrupted = True
+        time_limited = control is not None and control.kind == "stage_time_limit"
+        interrupted = not time_limited
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
         if requests:
@@ -1359,14 +1535,14 @@ def run_session(client, config, tasks, session, state=None):
             ui.log(f"FAIL lane {session + 1}: {error}")
     if ui:
         ui.lane(session, completed=completed, finished=len(task_results) if interrupted else attempted,
-                failures=attempted - completed - int((interrupted or context_limited) and attempted > len(task_results)),
-                status="cancelled" if interrupted else "context limit" if context_limited else "stopped" if error else "completed")
+                failures=attempted - completed - int((interrupted or context_limited or time_limited) and attempted > len(task_results)),
+                status="cancelled" if interrupted else "time limit" if time_limited else "context limit" if context_limited else "stopped" if error else "completed")
     state.update({"messages": messages, "padding": mix_control.padding, "budget": budget, "context_reason": context_reason})
     return {"session": session, "seconds": time.perf_counter() - started, "planned_tasks": len(tasks),
             "attempted_tasks": attempted, "completed_tasks": completed,
-            "failed_tasks": attempted - completed - int((interrupted or context_limited) and attempted > len(task_results)),
+            "failed_tasks": attempted - completed - int((interrupted or context_limited or time_limited) and attempted > len(task_results)),
             "interrupted": interrupted, "unfinished_tasks": len(tasks) - len(task_results),
-            "context_limited": context_limited, "context_reason": context_reason,
+            "context_limited": context_limited, "context_reason": context_reason, "time_limited": time_limited,
             "context_skipped_tasks": len(tasks) - attempted if context_limited else 0, "context_budget": budget.snapshot(),
             "cancelled_requests": sum(r.get("cancelled", False) for r in requests),
             "load_completed_tasks": exercised, "task_results": task_results,
@@ -1379,16 +1555,33 @@ def run_session(client, config, tasks, session, state=None):
             "requests": requests, "error": error}
 
 
-def run_profile(client, config, workload, lanes, warmup_tasks=0):
+def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_rate=None, stage_timeout=None):
     if len(workload) != lanes:
         raise ValueError("Each profile requires exactly one session per lane")
     if getattr(client, "control", None) is None:
         client.control = RunControl()
     barrier = threading.Barrier(lanes)
-    measurement_barrier = threading.Barrier(lanes)
     measurement_started_at = None
     warmup_started_at = time.perf_counter()
     warmup_sessions = []
+    time_budget = {}
+    stage_control = StageControl(client.control)
+    stage_client = StageClient(client, stage_control)
+    def start_measurement():
+        nonlocal measurement_started_at
+        if stage_prefill_rate is not None:
+            time_budget.update(stage_budget(warmup_sessions, workload, config.tasks, stage_prefill_rate))
+            if stage_timeout is not None:
+                time_budget.update(seconds=stage_timeout, override=True)
+            stage_control.start(time_budget["seconds"])
+            ui = getattr(client, "progress", None)
+            if ui and hasattr(ui, "stage_budget"):
+                ui.stage_budget(time_budget["seconds"])
+            limit = f"{time_budget['seconds']:g}s" if time_budget['seconds'] else "disabled"
+            emit(client, f"RIPAL-{lanes}L measured time budget: {limit}; "
+                 f"forecast fresh={time_budget['estimated_fresh_tokens']:,}, decode allowance={time_budget['decode_allowance_seconds']:.1f}s")
+        measurement_started_at = time.perf_counter()
+    measurement_barrier = threading.Barrier(lanes, action=start_measurement)
     finished = threading.Event()
     lock = threading.Lock()
     remaining = lanes
@@ -1401,15 +1594,12 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0):
         state = {}
         if warmup_tasks:
             warm_config = replace(config, tasks=warmup_tasks, filler=False)
-            warm_client = PhaseClient(client, "warmup")
+            warm_client = PhaseClient(stage_client, "warmup")
             warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
             with lock:
                 warmup_sessions.append(warm)
         measurement_barrier.wait()
-        with lock:
-            if measurement_started_at is None:
-                measurement_started_at = time.perf_counter()
-        measured_client = PhaseClient(client, "measured", warmup_tasks)
+        measured_client = PhaseClient(stage_client, "measured", warmup_tasks)
         primary = run_session(measured_client, config, tasks[warmup_tasks:], index, state=state)
         with lock:
             remaining -= 1
@@ -1417,10 +1607,10 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0):
                 primary_finished_at = time.perf_counter()
                 finished.set()
         if config.filler:
-            filler_client = FillerClient(client, finished)
+            filler_client = FillerClient(stage_client, finished)
             sequence = 0
             padding = primary["mix_adjustments"][-1]["next_padding_words"] if primary["mix_adjustments"] else config.filler_words
-            while not finished.is_set() and not stop_requested(client):
+            while not finished.is_set() and not stage_control.stopped:
                 seed = int.from_bytes(hashlib.sha256(f"{config.seed}:filler:{index}:{sequence}".encode()).digest()[:8], "big")
                 filler_config = replace(config, seed=seed, tasks=1, filler=False, filler_words=padding)
                 item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index)
@@ -1434,7 +1624,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0):
                     break
             ui = getattr(client, "progress", None)
             if ui:
-                ui.lane(index, status="cancelled" if stop_requested(client) else "completed")
+                ui.lane(index, status="cancelled" if stop_requested(client) else "time limit" if primary.get("time_limited") else "context limit" if primary.get("context_limited") else "completed")
         return primary
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         futures = [pool.submit(worker, index, tasks) for index, tasks in enumerate(workload)]
@@ -1442,13 +1632,18 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0):
     elapsed = (primary_finished_at or time.perf_counter()) - (measurement_started_at or started)
     warmup_seconds = (measurement_started_at or time.perf_counter()) - warmup_started_at
     valid = all(s["error"] is None and s["completed_tasks"] == config.tasks for s in sessions)
-    credit = sum(s["load_completed_tasks"] for s in sessions) / config.tasks
+    completed_work = sum(s["load_completed_tasks"] for s in sessions)
+    credit = completed_work / SCORE_TASKS
+    time_limited = any(s.get("time_limited") for s in sessions)
+    projected_seconds = extrapolate_seconds(elapsed, completed_work, config.tasks * lanes) if time_limited else elapsed
     primary_mix = token_mix(s["token_mix"] for s in sessions)
     # A tail filler may be cancelled mid-response. Its unreturned usage is unknown;
     # retain that fact separately instead of inventing token counts.
     filler_observed = [s["observed_token_mix"] for s in filler_sessions if s["observed_token_mix"].get("available")]
     observed_mix = token_mix([primary_mix] + filler_observed) if filler_observed else primary_mix
     return {"lanes": lanes, "seconds": elapsed, "valid": valid,
+            "time_limited": time_limited, "stage_budget": time_budget,
+            "estimated_full_seconds": projected_seconds, "score_work_unit_tasks": SCORE_TASKS,
             **termination_state(client), "interrupted": any(s["interrupted"] for s in sessions) or stop_requested(client),
             "score": score(credit, elapsed) if not config.strict or valid else None,
             "effective_sessions": credit, "sessions": sessions, "token_mix": observed_mix,
@@ -1548,26 +1743,35 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
         interval = [percentile(points, .025), percentile(points, .975)]
     latencies = [s["seconds"] for run in runs for s in run["sessions"]]
     sessions = [s for run in runs for s in run["sessions"]]
+    time_limited = any(run.get("time_limited") for run in runs)
     planned = sum(s.get("planned_tasks", 0) for s in sessions)
     passed = sum(s.get("completed_tasks", 0) for s in sessions)
     failed = sum(s.get("failed_tasks", 0) for s in sessions)
     accuracy = passed / planned if planned else None
     context_skipped = sum(s.get("context_skipped_tasks", 0) for s in sessions)
-    quality_tasks = planned - context_skipped
+    quality_tasks = sum(len(s.get("task_results", [])) if s.get("time_limited") else
+                        s.get("planned_tasks", 0) - s.get("context_skipped_tasks", 0) for s in sessions)
     quality = sum(s.get("quality_credit", s.get("completed_tasks", 0)) for s in sessions) / quality_tasks if quality_tasks else None
-    edit_score = score(lanes * quality, mean) if scored and quality is not None else None
+    projected_completions = [extrapolate_seconds(s["seconds"], s.get("load_completed_tasks", 0), s.get("planned_tasks", 0))
+                             if s.get("time_limited") else s["seconds"] for s in sessions]
+    quality_credit = sum(s.get("quality_credit", s.get("completed_tasks", 0)) for s in sessions)
+    edit_score = score(quality_credit / len(runs) / SCORE_TASKS, mean) if scored and quality is not None else None
     return {"profile": f"RIPAL-{lanes}L", "valid": valid, "measured_runs": len(runs),
-            "interrupted": interrupted,
-            "complete_batches": sum(not run.get("interrupted", False) for run in runs),
+            "interrupted": interrupted, "time_limited": time_limited,
+            "estimated_full_seconds": statistics.mean(run.get("estimated_full_seconds", run["seconds"]) for run in runs)
+                if all(run.get("estimated_full_seconds", run["seconds"]) is not None for run in runs) else None,
+            "complete_batches": sum(not run.get("interrupted", False) and not run.get("time_limited", False) for run in runs),
             "cancelled_requests": sum(s.get("cancelled_requests", 0) for s in sessions),
             "unfinished_tasks": sum(s.get("unfinished_tasks", 0) for s in sessions),
             "correct": correct, "token_mix": mix, "mix_valid": mix_valid,
-            "score_status": "interrupted_partial" if interrupted else "verified" if valid else "with_failures_or_unverified_mix",
+            "score_status": "interrupted_partial" if interrupted else "time_limited_estimate" if time_limited else "verified" if valid else "with_failures_or_unverified_mix",
             "planned_tasks": planned, "passed_tasks": passed, "failed_tasks": failed,
             "context_skipped_tasks": context_skipped,
             "context_limited_sessions": sum(s.get("context_limited", False) for s in sessions),
             "task_accuracy": accuracy,
             "phase_averages": average_phases(sessions, lanes),
+            "average_estimated_completion_seconds": statistics.mean(projected_completions)
+                if projected_completions and all(value is not None for value in projected_completions) else None,
             "api_errors": sum(api_error_counts(sessions).values()),
             "edit_quality": quality,
             "text_edit_distance": sum(task["text_quality"]["distance"] for s in sessions
@@ -1636,8 +1840,15 @@ def main():
                         help="full retains warmup + test history (default); auto/task permit compaction")
     parser.add_argument("--cache-policy", choices=["server-default", "enabled", "disabled"], default="server-default",
                         help="Declare server policy; disabled permits zero-cache accounting when absent. Configure the server separately.")
-    parser.add_argument("--tasks", type=positive, default=Config().tasks,
-                        help="Maximum measured tasks per lane/session (default 8); context limits may stop earlier")
+    task_options = parser.add_mutually_exclusive_group()
+    task_options.add_argument("--tasks", type=positive,
+                              help="Use this many measured tasks per lane at every concurrency")
+    task_options.add_argument("--task-schedule", nargs="+", type=schedule_entry, metavar="C:TASKS",
+                              help="Task counts by minimum concurrency; default 1:16 2:8 4:4; last entry applies above it")
+    parser.add_argument("--stage-prefill-rate", type=float, default=1000,
+                        help="Prefill tok/s floor for the minute-rounded measured-stage budget (default 1000)")
+    parser.add_argument("--stage-timeout", type=float,
+                        help="Override measured-stage seconds; 0 disables the cap; default calibrates from warmups")
     for name in ("records", "words", "max_tokens"):
         parser.add_argument("--" + name.replace("_", "-"), type=positive,
                             default=getattr(Config(), name))
@@ -1670,6 +1881,18 @@ def main():
         parser.error("lane counts must be unique")
     if not isinstance(args.extra_body, dict):
         parser.error("extra-body must be a JSON object")
+    if not math.isfinite(args.stage_prefill_rate) or args.stage_prefill_rate <= 0:
+        parser.error("stage-prefill-rate must be positive and finite")
+    if args.stage_timeout is not None and (not math.isfinite(args.stage_timeout) or args.stage_timeout < 0):
+        parser.error("stage-timeout must be nonnegative and finite")
+    if args.tasks is None:
+        args.task_schedule = args.task_schedule or DEFAULT_TASK_SCHEDULE
+        args.tasks = Config().tasks
+        try:
+            for lanes in args.lanes:
+                tasks_for_lanes(lanes, args.task_schedule)
+        except ValueError as exc:
+            parser.error(str(exc))
     config = Config(**{name: getattr(args, name) for name in Config.__dataclass_fields__})
     client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),
                     args.timeout, args.extra_body, args.cache_policy)
@@ -1780,14 +2003,16 @@ def run_benchmark(args, client, config):
         emit(client, f"RIPAL-{lanes}L response deadline {deadline:.2f}s ({basis})")
         seed_text = f"{args.seed}:session:{repeat}:{lanes}"
         batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
-        batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes])
+        batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes],
+                               tasks=tasks_for_lanes(lanes, args.task_schedule) if args.task_schedule else args.tasks)
         ui = getattr(client, "progress", None)
         if ui:
-            ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {config.tasks} measured · deadline {deadline:.1f}s",
-                     lanes, args.warmup_tasks + config.tasks, batch_config.filler_words)
-        workload_config = replace(batch_config, tasks=args.warmup_tasks + config.tasks)
+            ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {batch_config.tasks} measured · deadline {deadline:.1f}s",
+                     lanes, args.warmup_tasks + batch_config.tasks, batch_config.filler_words)
+        workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
         workload = [make_session(workload_config, index) for index in range(lanes)]
-        run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks)
+        run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
+                          stage_prefill_rate=args.stage_prefill_rate, stage_timeout=args.stage_timeout)
         run["tool_timeout_seconds"] = deadline
         run["timeout_basis"] = {"previous_lanes": previous_lanes, "previous_max_seconds": previous_max, "multiplier": 4}
         observed_max = max_completed_response_seconds(run)
@@ -1845,6 +2070,7 @@ def run_benchmark(args, client, config):
               "suite_complete": not stop_requested(client),
               "unmeasured_lanes": [n for n in args.lanes if str(n) not in summaries],
               "requested_lanes": args.lanes,
+              "task_schedule": args.task_schedule, "uniform_tasks": args.tasks if not args.task_schedule else None,
               "config": asdict(config), "cache_policy": args.cache_policy,
               "transformation_cycle": list(TRANSFORMATION_CYCLE), "vocabulary_words": len(WORDS),
               "pig_latin_vocabulary_words": len(PIG_LATIN_WORDS),
@@ -1855,11 +2081,15 @@ def run_benchmark(args, client, config):
                               "warmups_in_same_session": True, "repeats": args.repeats,
                               "bootstrap_samples": args.bootstrap_samples, "session_count": "equals lanes",
                               "initial_tool_timeout_seconds": args.timeout,
+                              "stage_prefill_floor_tokens_per_second": args.stage_prefill_rate,
+                              "stage_timeout_override_seconds": args.stage_timeout,
+                              "projection_method": "observed measured seconds * planned tasks / completed tool cycles",
                               "tool_timeout_policy": "4x previous concurrency maximum completed response",
                               "max_completed_response_seconds_by_lanes": profile_maxima,
                               "mix_control": "adaptive" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
                               "seed_policy": "SHA256(base_seed:session:repeat:lanes), warmup and measured task histories concatenated"},
-              "score_formula": "1000 * asinh(60 * mean_effective_sessions / mean_batch_seconds) / asinh(1)",
+              "score_formula": "1000 * asinh(60 * (completed_tasks / 8) / measured_seconds) / asinh(1)",
+              "score_work_unit_tasks": SCORE_TASKS,
               "failure_policy": "strict" if args.strict else "continue; load score and accuracy reported separately",
               "quality_method": "character Levenshtein: 1 - distance/max(expected_length, received_length); "
                                 "zero credit for copied source, invalid routing/metadata, or unfinished work",

@@ -12,8 +12,10 @@ For authentication, set `OPENAI_API_KEY` (or select another variable with `--api
 Tasks cycle through Pig Latin, reverse each word, remove vowels (`aeiou`), and invert case.
 The 293-word vocabulary excludes vowel-initial words for Pig Latin only; case tasks use mixed capitalization.
 
-Defaults: each lane keeps one continuous history: two warmup tasks + eight measured tasks.
-Set `--tasks N` to cap measured tasks per lane/session; `--warmup-tasks N` controls warmups separately.
+Defaults: each lane keeps one continuous history with two warmups, followed by 16 measured tasks at C=1,
+8 at C=2, and 4 at C≥4. Set `--task-schedule 1:16 2:8 4:4` to change the concurrency thresholds;
+the last entry applies to higher levels. `--tasks N` instead uses N at every level.
+`--warmup-tasks N` controls warmups separately.
 Add `--no-filler` to prevent extra unscored tasks on early-finishing lanes.
 Timing and prefill/decode statistics exclude warmups. Each concurrency finishes before the next starts.
 Adaptive padding targets 4:1 fresh-input/decode; early lanes run unscored filler.
@@ -26,6 +28,13 @@ Rates show estimated total (per lane).
 Prefill estimates include queue/network time; streaming chunks may buffer tokens.
 Saves `ripal-results.json` and `ripal-results.card.txt`.
 Re-render offline: `python3 ripal.py --render ripal-results.json` (`--card-output card.txt` saves it).
+
+Measured stages have a warmup-calibrated budget: forecast fresh tokens / 1,000 tok/s + streamed decode allowance when available,
+rounded up to a minute. Caps cancel pending work and continue to the next concurrency level.
+Completed work determines the score; full completion times are extrapolated and labeled as estimates.
+Extrapolation assumes the observed completed-task rate continues.
+Scores use one fixed eight-task work unit. `--stage-prefill-rate N` adjusts the floor;
+`--stage-timeout SECONDS` sets a fixed cap (`0` disables it).
 
 Ctrl-C saves partial results. HTTP 429 or a response deadline stops the run.
 Deadlines start at 60s, then use 4× the previous concurrency's longest completed response.
