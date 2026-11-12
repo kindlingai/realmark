@@ -1,0 +1,36 @@
+╭─────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ RealMark Results  ·  google/gemini-2.5-flash-lite                                               │
+│                                                                                                 │
+│   C  RIPAL Score  Decode (tok/s)  Prefill (tok/s)  Completed  Time (s)   Match (%)  Mix (w / t) │
+│   1         89.8   4,913 (4,913)    8,704 (8,704)       9/16   ~11,727      0% (F)      185w/—t │
+│   2      1,318.7  65.3k (32.7k)¹   18,684 (9,342)      13/16    164.34     0% (F)²     38.6w/—t │
+│   4        815.3   29.2k (7,289)   27,672 (6,918)      16/16     85.09     0% (F)³     ~122w/—t │
+│                                                                                                 │
+│ RIPAL Score  ·  Y: points ±1 task-adjusted SD    Total decode~  ·  Y: tok/s ±1σ                 │
+│ 3,100 │            ⠐⡖                            230,000 │           ⠐⡖                         │
+│       │             ⡇                                    │            ⡇                         │
+│       │             ⡇                            115,000 │           ⣀⣇⣀⣀⣀⡀                     │
+│       │             ⡇                                    │⡤⢀⣀⣀⠤⠤⠔⠒⠊⠉⠉ ⡇   ⠈⠉⠉⠉⠉⠉⠉⠉⠑⠒⠒⠒⠒⠒⠒⠒⠢⠤⠤⠤⣶ │
+│       │             ⡇                                  0 └⠉⠁─────────⠈⠉──────────────────────── │
+│       │             ⡇                        ⢹            1           2                       4 │
+│ 1,550 │             ⡇                        ⢸   X: concurrency (C), 1–4                        │
+│       │            ⢀⡧⠤⣀⣀⣀                    ⢸                                                  │
+│       │         ⢀⡠⠊⠁⡇    ⠉⠉⠉⠒⠒⠒⠢⠤⠤⢄⣀⣀⣀       ⢸   Total prefill~  ·  Y: tok/s ±1σ                │
+│       │       ⡠⠔⠁   ⡇                 ⠉⠉⠉⠒⠒⠒⠤⢼   43,000 │                                     ⢹ │
+│       │    ⢀⠤⠊      ⡇                        ⢸          │            ⢲⠂              ⢀⣀⣀⣀⣀⣀⡠⠤⠤⢼ │
+│       │  ⡠⠒⠁        ⡇                        ⢸   23,000 │        ⣀⣀⣀⠤⢼⠤⠤⠤⠒⠒⠒⠒⠒⠒⠉⠉⠉⠉⠉⠉⠁        ⢸ │
+│       │⣴⠉           ⡇                        ⢸          │⡯⠤⠒⠒⠒⠉⠉⠉    ⣸⡀                       ⠉ │
+│     0 └────────────⠈⠉────────────────────────⠉    3,000 └⠉───────────────────────────────────── │
+│        1            2                        4           1           2                        4 │
+│ X: concurrency (C), 1–4                          X: concurrency (C), 1–4                        │
+│                                                                                                 │
+│ C=1 time cap: 187.5s observed; 11726.6s projected full batch.                                   │
+│ C=2 context limit: 3 tasks not started; scores use partial work.                                │
+│ Notes                                                                                           │
+│ ¹ C=2 looping detected — L1/T4: 1,142 words repeating a 1-word motif; L1/T5: 664 words          │
+│   repeating a 1-word motif.                                                                     │
+│ ² C=2 major word corruption — L1/T3 (6% expected-word overlap), L1/T4 (0% expected-word         │
+│   overlap), L1/T5 (0% expected-word overlap).                                                   │
+│ ³ C=4 major word corruption — L1/T2 (8% expected-word overlap), L2/T1 (55% expected-word        │
+│   overlap), L4/T1 (52% expected-word overlap).                                                  │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────╯
