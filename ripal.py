@@ -509,6 +509,12 @@ STYLES = {"0": CREAM, "1": "1;" + CREAM, "2": MUTED,
           "31": WARNING, "33": AMBER, "32": AMBER}
 
 
+def format_duration(seconds):
+    tenths = max(0, round(seconds * 10))
+    minutes, remainder = divmod(tenths, 600)
+    return f"{minutes}:{remainder // 10:02d}.{remainder % 10}"
+
+
 def safe_text(value):
     return "".join(c if c >= " " and c != "\x7f" else " " for c in str(value))
 
@@ -627,7 +633,7 @@ class TerminalUI:
             else:
                 state["accounted"] = False
                 counts = "token accounting unavailable"
-            message = f"lane {index + 1} {state['stage']} returned in {seconds:.2f}s | {counts}"
+            message = f"lane {index + 1} {state['stage']} returned in {format_duration(seconds)} | {counts}"
             self.events.append(message)
             if not self.live:
                 self.stream.write("  " + message + "\n")
@@ -674,19 +680,19 @@ class TerminalUI:
         known = all(s["accounted"] for _, s in lanes)
         ratio = f"{fresh / output:.2f}:1" if known and output else "pending/unknown"
         spin = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(now * 8) % 10]
-        budget_text = f"Stage left {max(0, stage_deadline - now):.1f}s · " if stage_deadline is not None else ""
+        budget_text = f"Stage left {format_duration(stage_deadline - now)} · " if stage_deadline is not None else ""
         if stage_control and stage_control.cutoff is not None and stage_control.drainers:
             budget_text = f"Draining task {stage_control.cutoff['task']} · "
         lines = [paint("RIPAL  /  local prefill + decode benchmark", "1;36"),
                  paint(f"{self.model}  ·  {self.endpoint}", "2"), "",
-                 paint(f"{phase}  ·  elapsed {now - self.started:.1f}s  ·  initial padding {padding:,} words", "1"),
+                 paint(f"{phase}  ·  elapsed {format_duration(now - self.started)}  ·  initial padding {padding:,} words", "1"),
                  paint(f"[{'━' * filled}{'─' * (24 - filled)}]  {finished}/{total} processed · {completed} passed · {failures} failed", "36"),
                  paint(f"{budget_text}Batch tokens  fresh {fresh:,}  decode {output:,}  running ratio {ratio}  (target 4:1)", "2"), "",
                  paint("LANE  TASK    TOOL / STATE                  REQUEST AGE    CALLS  FAILS  WORDS", "1;34")]
         visible = max(1, height - 16)
         for index, state in lanes[:visible]:
             waiting = state["status"] == "waiting"
-            age = f"{now - state['since']:.1f}s" if waiting else "—"
+            age = format_duration(now - state["since"]) if waiting else "—"
             label = state["stage"] if waiting else state["status"]
             retry = f" retry {state['attempt'] - 1}" if state["attempt"] > 1 else ""
             marker = spin if waiting else "✓" if state["status"] == "completed" else "!" if state["status"] == "stopped" else "·"
@@ -2351,9 +2357,9 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             ui = getattr(client, "progress", None)
             if ui and hasattr(ui, "stage_budget"):
                 ui.stage_budget(time_budget["seconds"], stage_control)
-            limit = f"{time_budget['seconds']:g}s" if time_budget['seconds'] else "disabled"
+            limit = format_duration(time_budget["seconds"]) if time_budget['seconds'] else "disabled"
             emit(client, f"RIPAL-{lanes}L measured time budget: {limit}; "
-                 f"forecast fresh={time_budget['estimated_fresh_tokens']:,}, decode allowance={time_budget['decode_allowance_seconds']:.1f}s")
+                 f"forecast fresh={time_budget['estimated_fresh_tokens']:,}, decode allowance={format_duration(time_budget['decode_allowance_seconds'])}")
         measurement_started_at = time.perf_counter()
     measurement_barrier = threading.Barrier(lanes, action=start_measurement)
     finished = threading.Event()
@@ -2845,15 +2851,15 @@ def run_benchmark(args, client, config):
         deadline, previous_lanes, previous_max = profile_timeout(lanes, args.lanes, profile_maxima, args.timeout)
         client.timeout = deadline
         client.timeout_reference_words = profile_response_words.get(previous_lanes, 256)
-        basis = f"4 × {previous_lanes}L max {previous_max:.2f}s" if previous_max is not None else "initial deadline"
-        emit(client, f"RIPAL-{lanes}L response deadline {deadline:.2f}s ({basis})")
+        basis = f"4 × {previous_lanes}L max {format_duration(previous_max)}" if previous_max is not None else "initial deadline"
+        emit(client, f"RIPAL-{lanes}L response deadline {format_duration(deadline)} ({basis})")
         seed_text = f"{args.seed}:session:{repeat}:{lanes}"
         batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
         batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes],
                                tasks=tasks_for_lanes(lanes, args.task_schedule) if args.task_schedule else args.tasks)
         ui = getattr(client, "progress", None)
         if ui:
-            ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {batch_config.tasks} measured · deadline {deadline:.1f}s",
+            ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {batch_config.tasks} measured · deadline {format_duration(deadline)}",
                      lanes, args.warmup_tasks + batch_config.tasks, batch_config.filler_words)
         workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
         workload = [make_session(workload_config, index) for index in range(lanes)]
@@ -2890,7 +2896,7 @@ def run_benchmark(args, client, config):
         if run["has_measurements"] or not stop_requested(client):
             runs.append(run)
         points = f"{run['score']:.1f}" if run["score"] is not None else "unavailable"
-        emit(client, f"RIPAL-{lanes}L measured={repeat + 1} seconds={run['seconds']:.3f} provisional_load_score={points}")
+        emit(client, f"RIPAL-{lanes}L measured={repeat + 1} time={format_duration(run['seconds'])} provisional_load_score={points}")
     summaries = {}
     for lanes in args.lanes:
         group = [run for run in runs if run["lanes"] == lanes]
@@ -2903,10 +2909,10 @@ def run_benchmark(args, client, config):
         points = f"{summary['score']:.1f}" if summary["score"] is not None else "INVALID"
         interval = summary["score_ci95"]
         confidence = f"[{interval[0]:.1f}, {interval[1]:.1f}]" if interval else "unavailable"
-        deviation = f"{summary['stdev_seconds']:.3f}s" if summary["stdev_seconds"] is not None else "unavailable"
+        deviation = format_duration(summary["stdev_seconds"]) if summary["stdev_seconds"] is not None else "unavailable"
         cv = f"{100 * summary['timing_cv']:.1f}%" if summary["timing_cv"] is not None else "unavailable"
         emit(client, f"{summary['profile']}: {points} points; 95% CI {confidence}; "
-              f"time {summary['mean_seconds']:.3f}s ± {deviation}; CV {cv}; "
+              f"time {format_duration(summary['mean_seconds'])} ± {deviation}; CV {cv}; "
               f"fresh/output={summary['token_mix'].get('fresh_per_output')}; mix_valid={summary['mix_valid']}")
     scores = {lanes: summary["score"] for lanes, summary in summaries.items()}
     aggregate = (0.0 if any(value == 0 for value in scores.values()) else
