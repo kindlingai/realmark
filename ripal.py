@@ -194,6 +194,102 @@ class MixController:
         return event
 
 
+def read_stream(response, started, control=None):
+    message = {"role": "assistant", "content": None}
+    calls, result, data = {}, {}, []
+    first = last = None
+    finish_reason = None
+    done = False
+    def consume(payload):
+        nonlocal first, last, finish_reason, done
+        if payload == "[DONE]":
+            done = True
+            return
+        chunk = json.loads(payload)
+        for key in ("id", "model", "created", "usage", "metrics", "timings"):
+            if chunk.get(key) is not None:
+                result[key] = chunk[key]
+        for choice in chunk.get("choices", []):
+            if choice.get("index", 0) != 0:
+                continue
+            delta = choice.get("delta") or {}
+            generated = False
+            for key in ("content", "reasoning_content", "reasoning"):
+                value = delta.get(key)
+                if value:
+                    target = "reasoning_content" if key == "reasoning" else key
+                    message[target] = (message.get(target) or "") + value
+                    generated = True
+            for part in delta.get("tool_calls") or []:
+                call = calls.setdefault(part.get("index", 0), {"id": "", "type": "function",
+                                        "function": {"name": "", "arguments": ""}})
+                if part.get("id"):
+                    call["id"] = part["id"]
+                function = part.get("function") or {}
+                for key in ("name", "arguments"):
+                    fragment = function.get(key)
+                    if fragment:
+                        if key != "name" or fragment != call["function"][key]:
+                            call["function"][key] += fragment
+                        generated = True
+            if generated:
+                now = time.perf_counter()
+                if first is None:
+                    first = now
+                last = now
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+    for raw in response:
+        if control:
+            control.check()
+        line = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        line = line.rstrip("\r\n")
+        if line.startswith("data:"):
+            data.append(line[5:].lstrip())
+        elif not line and data:
+            consume("\n".join(data))
+            data = []
+            if done:
+                break
+    if data and not done:
+        consume("\n".join(data))
+    if not done:
+        raise ValueError("Stream ended before [DONE]")
+    if calls:
+        message["tool_calls"] = [calls[index] for index in sorted(calls)]
+    result["choices"] = [{"index": 0, "finish_reason": finish_reason, "message": message}]
+    result["_stream_timing"] = {"source": "visible streaming deltas",
+        "first_output_seconds": first - started if first is not None else None,
+        "generation_seconds": last - first if first is not None else None,
+        "response_seconds": time.perf_counter() - started}
+    return result
+
+
+def phase_timing(response, tokens):
+    timing = response.get("_stream_timing")
+    if not timing:
+        return None
+    return {**timing, "fresh_tokens": tokens.get("fresh_tokens"),
+            "output_tokens": tokens.get("output_tokens")}
+
+
+def average_phases(sessions):
+    completed = [request for session in sessions for request in session.get("requests", [])
+                 if request.get("received_response") and not request.get("cancelled")]
+    samples = [r["phase_timing"] for r in completed if r.get("phase_timing")]
+    prefill = [s for s in samples if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
+    decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
+    return {
+        "source": "streaming estimates; visible deltas may be buffered",
+        "prefill_tokens_per_second": sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None,
+        "decode_tokens_per_second": sum(s["output_tokens"] - 1 for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None,
+        "prefill_samples": len(prefill), "decode_samples": len(decode),
+        "average_tool_seconds": sum(r["seconds"] for r in completed) / len(completed) if completed else None,
+        "average_completion_seconds": sum(s["seconds"] for s in sessions) / len(sessions) if sessions else None,
+        "prefill_caveat": "fresh tokens / time to first visible generation, including queue/network delay",
+        "decode_caveat": "(output tokens - 1) / first-to-last visible generation interval; chunk buffering affects estimates"}
+
+
 BACKGROUND = "48;2;28;25;23"
 CREAM = "38;2;230;224;214"
 MUTED = "38;2;146;137;123"
@@ -337,7 +433,7 @@ class TerminalUI:
             lines.append(paint(f"… {len(lanes) - visible} additional lanes", "2"))
         lines.extend(["", paint("RECENT EVENTS", "1;34")])
         lines.extend(paint("  " + event, "31" if "FAIL" in event or "mismatch" in event else "2") for event in events)
-        lines.extend(["", paint("Awaiting response includes server queueing, prefill and decode; token counts arrive on completion.", "2")])
+        lines.extend(["", paint("Request age includes queueing + prefill + decode. Streaming samples timing; final usage gives token totals.", "2")])
         return "\n".join(line if line else paint("") for line in lines[:max(1, height - 1)])
 
     def card(self, text):
@@ -468,6 +564,17 @@ def result_card(report, width=98):
             f"{summary.get('response_failures', 0):>6}  {mix:>9}")
     add()
     if summaries:
+        add("C      Prefill~ tok/s    Decode~ tok/s    Avg completion s    Batch s")
+        for lanes, summary in summaries:
+            phases = summary.get("phase_averages", {})
+            def metric(value):
+                return f"{value:,.2f}" if value is not None else "—"
+            add(f"{int(lanes):>2}L {metric(phases.get('prefill_tokens_per_second')):>16} "
+                f"{metric(phases.get('decode_tokens_per_second')):>16} "
+                f"{metric(phases.get('average_completion_seconds')):>19} "
+                f"{metric(summary.get('mean_seconds')):>10}")
+        add("~ Streaming estimates per request; prefill includes queue/network delay.")
+        add()
         plot = report.get("score_plot") or braille_plot([(int(n), s["score"]) for n, s in summaries])
         add(f"Load score vs concurrency  ·  top {plot['max_score']:,.1f}  ·  baseline 0")
         for line in plot["lines"]:
@@ -545,6 +652,11 @@ class FillerClient:
 
     def __getattr__(self, name):
         return getattr(self.client, name)
+
+    def complete(self, messages, stage, config):
+        if getattr(self.client, "supports_stream_cancel", False):
+            return self.client.complete(messages, stage, config, cancel_control=self.control)
+        return self.client.complete(messages, stage, config)
 
 
 VERSION = "ripal-v6"
@@ -706,25 +818,33 @@ def validation_issue(stage, actual_name, expected, supplied):
 
 
 class Client:
-    def __init__(self, base_url, model, api_key="", timeout=60, extra=None, cache_policy="server-default"):
+    supports_stream_cancel = True
+
+    def __init__(self, base_url, model, api_key="", timeout=60, extra=None, cache_policy="server-default", streaming=True):
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.timeout = model, api_key, timeout
         self.extra = extra or {}
         self.cache_policy = cache_policy
+        self.streaming = streaming
         protected = {"model", "messages", "tools", "tool_choice", "stream", "n"}
         if protected.intersection(self.extra):
             raise ValueError(f"extra-body cannot override {sorted(protected)}")
 
-    def complete(self, messages, stage, config):
+    def complete(self, messages, stage, config, cancel_control=None):
         body = {"temperature": 0, "max_tokens": config.max_tokens, **self.extra,
                 "model": self.model, "messages": messages, "tools": TOOLS,
                 "tool_choice": {"type": "function", "function": {"name": stage}},
-                "parallel_tool_calls": False, "stream": False}
+                "parallel_tool_calls": False, "stream": self.streaming}
+        if self.streaming:
+            body["stream_options"] = {"include_usage": True}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(self.url, json.dumps(body).encode(), headers)
+        started = time.perf_counter()
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
+                return read_stream(response, started, cancel_control or getattr(self, "control", None))
             return json.load(response)
 
 
@@ -786,6 +906,7 @@ def run_session(client, config, tasks, session):
                         response = control.call(operation, getattr(client, "timeout", 60), stage) if control else operation()
                         received = True
                         entry["tokens"] = request_tokens(response, getattr(client, "cache_policy", "server-default"))
+                        entry["phase_timing"] = phase_timing(response, entry["tokens"])
                         for key, value in (response.get("usage") or {}).items():
                             if isinstance(value, (int, float)):
                                 usage[key] = usage.get(key, 0) + value
@@ -1101,6 +1222,7 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
             "score_status": "interrupted_partial" if interrupted else "verified" if valid else "with_failures_or_unverified_mix",
             "planned_tasks": planned, "passed_tasks": passed, "failed_tasks": failed,
             "task_accuracy": accuracy,
+            "phase_averages": average_phases(sessions),
             "edit_quality": quality,
             "text_edit_distance": sum(task["text_quality"]["distance"] for s in sessions
                                       for task in s.get("task_results", []) if task.get("text_quality")),
@@ -1141,7 +1263,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     parser.add_argument("--model", required=True)
-    parser.add_argument("--api-key-env", default="OPENAI_API_KEY")
+    parser.add_argument("--api-key-env", default="OPENAI_API_KEY",
+                        help="API key environment variable (default OPENAI_API_KEY); never saved in results")
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
     parser.add_argument("--repeats", type=positive, default=1)
     parser.add_argument("--warmup-tasks", "--warmups", dest="warmup_tasks", type=int, default=2,
@@ -1170,11 +1293,13 @@ def main():
                         help="Optional diagnostic retries per tool; default 0 (one attempt, then continue)")
     parser.add_argument("--strict", action="store_true", help="Stop sessions on validation failure; suppress unverified scores")
     parser.add_argument("--timeout", type=float, default=60,
-                        help="Hard wall-clock deadline per tool response; reaching it terminates the run (default 60s)")
+                        help="Initial response deadline (default 60s); later profiles use 4x the previous concurrency maximum")
     parser.add_argument("--extra-body", type=json.loads, default={})
     parser.add_argument("--ui", choices=["auto", "live", "plain"], default="auto",
                         help="Live VT dashboard on interactive terminals; plain logs when redirected")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
+    parser.add_argument("--no-stream", dest="streaming", action="store_false",
+                        help="Use non-streaming responses; separate prefill/decode estimates will be unavailable")
     parser.add_argument("--output", type=Path, default=Path("ripal-results.json"))
     args = parser.parse_args()
     if args.retries < 0 or args.warmup_tasks < 0 or args.calibration_rounds < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
@@ -1189,12 +1314,31 @@ def main():
     client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),
                     args.timeout, args.extra_body, args.cache_policy)
     client.timeout, client.ratio_tolerance = args.timeout, args.ratio_tolerance
+    client.streaming = args.streaming
     control = RunControl()
     client.control = control
     with control.signals():
         with TerminalUI(args.model, args.base_url, args.ui, args.color) as ui:
             client.progress = ui
             return run_benchmark(args, client, config)
+
+
+def max_completed_response_seconds(run):
+    values = [request["seconds"]
+              for session in run.get("sessions", []) + run.get("filler_sessions", [])
+              for request in session.get("requests", [])
+              if request.get("received_response") and not request.get("cancelled")
+              and request.get("validation", {}).get("kind") not in {"tool_timeout", "server_overload"}
+              and isinstance(request.get("seconds"), (int, float))
+              and math.isfinite(request["seconds"]) and request["seconds"] > 0]
+    return max(values, default=None)
+
+
+def profile_timeout(lanes, levels, maxima, initial=60):
+    index = levels.index(lanes)
+    previous = levels[index - 1] if index else None
+    observed = maxima.get(previous)
+    return (4 * observed if observed is not None else initial), previous, observed
 
 
 def batch_schedule(lanes, repeats, warmup_tasks):
@@ -1237,9 +1381,14 @@ def run_benchmark(args, client, config):
     runs = []
     warmups = []
     profile_padding = {lanes: config.filler_words for lanes in args.lanes}
+    profile_maxima = {}
     for is_warmup, repeat, lanes in batch_schedule(args.lanes, args.repeats, args.warmup_tasks):
         if stop_requested(client):
             break
+        deadline, previous_lanes, previous_max = profile_timeout(lanes, args.lanes, profile_maxima, args.timeout)
+        client.timeout = deadline
+        basis = f"4 × {previous_lanes}L max {previous_max:.2f}s" if previous_max is not None else "initial deadline"
+        emit(client, f"RIPAL-{lanes}L response deadline {deadline:.2f}s ({basis})")
         # Fresh content per profile/repetition, deterministic across models.
         seed_text = f"{args.seed}:{'warmup' if is_warmup else 'measured'}:{repeat}:{lanes}"
         batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
@@ -1250,9 +1399,14 @@ def run_benchmark(args, client, config):
                  f"Measured repeat {repeat + 1}/{args.repeats}")
         ui = getattr(client, "progress", None)
         if ui:
-            ui.begin(f"RIPAL-{lanes}L · {phase}", lanes, batch_config.tasks, batch_config.filler_words)
+            ui.begin(f"RIPAL-{lanes}L · {phase} · deadline {deadline:.1f}s", lanes, batch_config.tasks, batch_config.filler_words)
         workload = [make_session(batch_config, index) for index in range(lanes)]
         run = run_profile(client, batch_config, workload, lanes)
+        run["tool_timeout_seconds"] = deadline
+        run["timeout_basis"] = {"previous_lanes": previous_lanes, "previous_max_seconds": previous_max, "multiplier": 4}
+        observed_max = max_completed_response_seconds(run)
+        if observed_max is not None:
+            profile_maxima[lanes] = max(profile_maxima.get(lanes, 0), observed_max)
         run["repeat"] = repeat + 1
         run["tasks_per_session"] = batch_config.tasks
         run["initial_padding_words"] = batch_config.filler_words
@@ -1311,7 +1465,9 @@ def run_benchmark(args, client, config):
               "measurement": {"warmup_tasks_per_lane": args.warmup_tasks,
                               "warmup_batches_per_profile": int(args.warmup_tasks > 0), "repeats": args.repeats,
                               "bootstrap_samples": args.bootstrap_samples, "session_count": "equals lanes",
-                              "tool_timeout_seconds": args.timeout,
+                              "initial_tool_timeout_seconds": args.timeout,
+                              "tool_timeout_policy": "4x previous concurrency maximum completed response",
+                              "max_completed_response_seconds_by_lanes": profile_maxima,
                               "mix_control": "adaptive" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
                               "seed_policy": "SHA256(base_seed:phase:repeat:lanes), distinct content per batch"},
               "score_formula": "1000 * asinh(60 * mean_effective_sessions / mean_batch_seconds) / asinh(1)",
