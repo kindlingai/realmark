@@ -2698,7 +2698,8 @@ def main():
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
     parser.add_argument("--no-stream", dest="streaming", action="store_false",
                         help="Use non-streaming responses; separate prefill/decode estimates will be unavailable")
-    parser.add_argument("--output", type=Path, default=Path("ripal-results.json"))
+    parser.add_argument("--output", type=Path,
+                        help="Results filename (default realmark-MODEL.json)")
     args = parser.parse_args()
     if args.render:
         try:
@@ -2741,6 +2742,9 @@ def main():
         else:
             client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),
                             args.timeout, args.extra_body, args.cache_policy)
+        if args.output is None:
+            model_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", args.model).strip(".-") or "model"
+            args.output = Path(f"realmark-{model_filename}.json")
         client.timeout, client.ratio_tolerance = args.timeout, args.ratio_tolerance
         client.streaming = args.streaming
         control = RunControl()

@@ -12,7 +12,7 @@ Requires an OpenAI-compatible server with native tool calling.
 ```sh
 python3 ripal.py --base-url http://localhost:8000/v1 --model MODEL --lanes 1 2 4
 python3 ripal.py --simulate --sim-prefill 1000 --sim-decode 50 --lanes 1 2 4
-python3 ripal.py --render ripal-results.json
+python3 ripal.py --render realmark-MODEL.json
 ```
 
 Set `OPENAI_API_KEY` for authentication; `--api-key-env NAME` selects another variable.
@@ -49,7 +49,9 @@ JSON stores configuration and timestamped raw lane telemetry under
 `runs["c=2"].lanes[n].telemetry`: warmup/run/filler/partial event arrays,
 including requests, streamed chunks, responses, and tool messages. Scores and
 charts are recomputed on render. Old processed-result files are unsupported.
-The separate `.card.txt` contains the rendered result.
+Defaults to `realmark-MODEL.json` and `realmark-MODEL.card.txt`; model names are
+sanitized for filenames. `--output PATH` overrides the filename. The `.card.txt`
+contains the rendered result.
 Graph bars show ±1 sample SD: batch scores across repeats, otherwise task-rate
 variation; streaming-rate variation across requests. Missing SD is omitted.
 Y bounds round outward to two significant digits.
