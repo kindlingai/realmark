@@ -766,7 +766,7 @@ class TerminalUI:
                     if in_table and score_span:
                         a, b = score_span
                         content = content[:a] + "\x1b[1m" + content[a:b] + "\x1b[22m" + content[b:]
-                    for heading in ("RIPAL Score  ·  Y: points ±1σ", "Total decode~  ·  Y: tok/s ±1σ", "Total prefill~  ·  Y: tok/s ±1σ"):
+                    for heading in ("RIPAL Score  ·  Y: points ±1 task-adjusted SD", "Total decode~  ·  Y: tok/s ±1σ", "Total prefill~  ·  Y: tok/s ±1σ"):
                         content = content.replace(heading,
                             f"\x1b[0;{BACKGROUND};{MUTED}m{heading}\x1b[0;{BACKGROUND};{base}m")
                     colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{base}m{content}\x1b[{WHITE}m│\x1b[0m")
@@ -899,8 +899,8 @@ def middle_label(plot):
     return label.rstrip('0').rstrip('.') if '.' in label else label
 
 
-def chart_lines(plot, title, unit):
-    result = [f"{title}  ·  Y: {unit} ±1σ"]
+def chart_lines(plot, title, unit, spread="±1σ"):
+    result = [f"{title}  ·  Y: {unit} {spread}"]
     if not plot["has_data"]:
         return result + ["No measured data available."]
     bottom, top = axis_labels(plot)
@@ -970,7 +970,7 @@ def chart_grid(summaries, width):
     gutter = max(*map(len, axis_labels(plot)), len(middle_label(plot)))
     plot = braille_plot([(int(n), s["score"]) for n, s in summaries],
                         width=left_width - gutter - 2, height=len(right) - 4, errors={int(n): s.get("score_stdev") for n, s in summaries})
-    left = chart_lines(plot, "RIPAL Score", "points")
+    left = chart_lines(plot, "RIPAL Score", "points", "±1 task-adjusted SD")
     left += [""] * (len(right) - len(left))
     return [a.ljust(left_width) + " " * gap + b for a, b in zip(left, right)]
 
@@ -2551,6 +2551,33 @@ def percentile(values, fraction):
     return ordered[lower] * (1 - weight) + ordered[min(lower + 1, len(ordered) - 1)] * weight
 
 
+def task_adjusted_score_spread(sessions, lanes):
+    groups = {}
+    for session in sessions:
+        previous = 0
+        for task in session.get("task_results", []):
+            finished = task.get("finished_seconds", previous)
+            duration = finished - previous
+            previous = finished
+            words = task.get("load_words", 0)
+            if task.get("load_completed") and duration > 0 and words > 0:
+                groups.setdefault(task["transformation"], []).append(duration / words)
+    count = sum(map(len, groups.values()))
+    degrees = count - len(groups)
+    if not count:
+        return {"stdev": None, "samples": 0, "degrees_of_freedom": 0, "factors": {}}
+    overall = sum(map(sum, groups.values())) / count
+    factors = {name: overall / statistics.mean(values) for name, values in groups.items()}
+    residual_squares = 0
+    for name, values in groups.items():
+        normalized_scores = [score(lanes / SCORE_WORDS, value * factors[name]) for value in values]
+        center = statistics.mean(normalized_scores)
+        residual_squares += sum((value - center) ** 2 for value in normalized_scores)
+    return {"stdev": math.sqrt(residual_squares / degrees) if degrees > 0 else None,
+            "samples": count, "degrees_of_freedom": degrees, "factors": factors,
+            "overall_seconds_per_word": overall}
+
+
 def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
               target_ratio=None, ratio_tolerance=.15, allow_failures=False):
     times = [run["seconds"] for run in runs]
@@ -2589,20 +2616,13 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
                              if s.get("time_limited") else s["seconds"] for s in sessions]
     quality_credit = sum(s.get("quality_word_credit", s.get("quality_credit", s.get("completed_tasks", 0)) * 256) for s in sessions)
     edit_score = score(quality_credit / len(runs) / SCORE_WORDS, mean) if scored and quality is not None else None
-    score_samples = []
-    sigma_source = "concurrency-scaled measured task throughput"
-    for session in sessions:
-        previous = 0
-        for task in session.get("task_results", []):
-            finished = task.get("finished_seconds", previous)
-            duration = finished - previous
-            if task.get("load_completed") and duration > 0:
-                score_samples.append(score(lanes * task.get("load_words", 0) / SCORE_WORDS, duration))
-            previous = finished
+    spread = task_adjusted_score_spread(sessions, lanes)
     return {"profile": f"RIPAL-{lanes}L", "valid": valid, "measured_runs": len(runs),
             "interrupted": interrupted, "time_limited": time_limited,
-            "score_stdev": statistics.stdev(score_samples) if len(score_samples) > 1 else None,
-            "score_stdev_source": sigma_source, "score_stdev_samples": len(score_samples),
+            "score_stdev": spread["stdev"],
+            "score_stdev_source": "task-adjusted pooled score residuals; seconds per weighted word normalized by transformation",
+            "score_stdev_samples": spread["samples"], "score_stdev_degrees_of_freedom": spread["degrees_of_freedom"],
+            "score_time_normalization": spread["factors"],
             "estimated_full_seconds": statistics.mean(run.get("estimated_full_seconds", run["seconds"]) for run in runs)
                 if all(run.get("estimated_full_seconds", run["seconds"]) is not None for run in runs) else None,
             "complete_batches": sum(not run.get("interrupted", False) and not run.get("time_limited", False) for run in runs),

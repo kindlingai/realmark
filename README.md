@@ -52,7 +52,13 @@ charts are recomputed on render. Old processed-result files are unsupported.
 Defaults to `realmark-MODEL.json` and `realmark-MODEL.card.txt`; model names are
 sanitized for filenames. `--output PATH` overrides the filename. The `.card.txt`
 contains the rendered result.
-Graph bars show ±1 sample SD across completed tasks only. Prefill/decode samples
+Graph bars use completed tasks only. RIPAL Score shows ±1 task-adjusted SD:
+within each concurrency, seconds per weighted output word are multiplied by the
+overall task mean / transformation mean. Normalized times produce task scores;
+pooled within-transformation score residuals use N − G degrees of freedom
+(G = observed transformation types). No residual degrees of freedom means no bar.
+The overall score is unchanged; adjusted SD describes within-type variation, not
+uncertainty in the overall score. Decode/prefill show ±1 sample SD. Prefill/decode samples
 combine token totals and phase durations across each task’s requests. Fewer than
 two completed task samples omit the SD; warmups and partial tasks are excluded.
 Y bounds round outward to two significant digits, with the minimum clamped to zero.
