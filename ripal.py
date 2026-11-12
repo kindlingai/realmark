@@ -1572,7 +1572,9 @@ def main():
                         help="full retains warmup + test history (default); auto/task permit compaction")
     parser.add_argument("--cache-policy", choices=["server-default", "enabled", "disabled"], default="server-default",
                         help="Declare server policy; disabled permits zero-cache accounting when absent. Configure the server separately.")
-    for name in ("tasks", "records", "words", "max_tokens"):
+    parser.add_argument("--tasks", type=positive, default=Config().tasks,
+                        help="Maximum measured tasks per lane/session (default 8); context limits may stop earlier")
+    for name in ("records", "words", "max_tokens"):
         parser.add_argument("--" + name.replace("_", "-"), type=positive,
                             default=getattr(Config(), name))
     parser.add_argument("--seed", type=int, default=42)

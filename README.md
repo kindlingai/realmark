@@ -10,6 +10,8 @@ python3 ripal.py --base-url http://localhost:8000/v1 --model MODEL --lanes 1 2 4
 For authentication, set `OPENAI_API_KEY` (or select another variable with `--api-key-env NAME`).
 
 Defaults: each lane keeps one continuous history: two warmup tasks + eight measured tasks.
+Set `--tasks N` to cap measured tasks per lane/session; `--warmup-tasks N` controls warmups separately.
+Add `--no-filler` to prevent extra unscored tasks on early-finishing lanes.
 Timing and prefill/decode statistics exclude warmups. Each concurrency finishes before the next starts.
 Adaptive padding targets 4:1 fresh-input/decode; early lanes run unscored filler.
 Reads the model context limit from `/models` and stops admitting tasks before estimated overflow,
