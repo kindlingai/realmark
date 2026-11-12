@@ -848,7 +848,8 @@ class ContextBudget:
         preview = list(messages)
         for stage, arguments, result in [
             ("search_records", {"id": task["target"]["id"]}, {"path": task["path"]}),
-            ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding}),
+            ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding,
+                          "transformation": task["transformation"], "instructions": task["instructions"]}),
         ]:
             call_id = "budget-" + "x" * 100
             preview.append({"role": "assistant", "content": None, "tool_calls": [{
@@ -864,19 +865,56 @@ class ContextBudget:
                 "peak_reserved_context": self.peak_reserved}
 
 
-VERSION = "ripal-v7"
+VERSION = "ripal-v8"
 TARGET_RATIO = 4.0
-WORDS = "amber birch cedar delta ember fern garden harbor island jungle kettle lantern maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr".split()
+WORDS = """amber birch cedar delta ember fern garden harbor island jungle kettle lantern
+maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr
+acorn anchor apple apricot arrow autumn avocado azure badge bamboo banana barrel
+basket beach beacon beetle berry blanket blossom bottle branch breeze bridge brook
+brush bucket button cabin cactus candle canvas carrot castle cherry chestnut chimney
+circle citrus clover cloud cobalt coconut coral cotton cradle crane cricket crystal
+cucumber daisy dandelion desert diamond dolphin dragon drawer drum eagle earth echo
+elm emerald engine falcon feather fiddle field finch flame fleece flower flute forest
+fossil fountain fox freckle frost galaxy garlic gate ginger glacier globe goose grape
+grass gravel grove guitar hammock hammer hazel hedgehog helmet heron hickory honey
+horse iceberg igloo indigo insect iris iron ivy jacket jasmine jewel jigsaw journey
+juniper kernel kestrel kitchen kitten kiwi ladder lagoon lake lattice lavender leaf
+lemon leopard letter light lilac lily linen lizard lobster lotus magnet mango marble
+marigold meadow melon metal mirror mist monkey moon moss mountain mushroom mustard
+napkin needle nickel noodle nutmeg ocean octopus onion orange orchid otter oyster
+paddle palace panda paper parsley peach peanut pear pelican pencil pepper petal piano
+pickle pigeon pillow pine planet plum pocket pond potato prairie prism pumpkin rabbit
+raccoon radish rain raven ribbon ripple robin rocket rope rosemary ruby saddle saffron
+sail salmon sand satin scarf shell shield shore shrimp shrub skylark slate sleeve
+snail snow sparrow spider spinach sponge spruce squirrel star stone storm strawberry
+stream summit sunflower swallow swan tablet tangerine temple thimble thistle thunder
+tiger tomato torch tower tractor trail trumpet tulip turtle umbrella uniform urn
+vanilla velvet violet walnut water wave weasel wheat wheel whistle window winter
+wizard wolf wood wren yarn yeast zebra zipper zucchini""".split()
+VOWELS = "aeiouAEIOU"
+PIG_LATIN_WORDS = [word for word in WORDS if word[0] not in VOWELS]
+TRANSFORMATIONS = {
+    "pig_latin": "Move the first letter of EACH word to its end, then append 'ay': "
+                 "'bright little lantern' -> 'rightbay ittlelay anternlay'. "
+                 "Use exactly word[1:] + word[0] + 'ay'; do not use conventional Pig Latin rules.",
+    "reverse_words": "Reverse the letters within EACH word, preserving word order and letter case: "
+                     "'Hello world' -> 'olleH dlrow'.",
+    "remove_vowels": "Remove every a, e, i, o, u (uppercase or lowercase) from EACH word. "
+                     "Keep y and preserve remaining letters, their case, and word order: "
+                     "'Hello world' -> 'Hll wrld'.",
+    "invert_case": "Swap the case of EVERY letter: lowercase becomes uppercase and uppercase becomes lowercase. "
+                   "Keep letter order and word order: 'Mike hello HELlo' -> 'mIKE HELLO helLO'.",
+}
+TRANSFORMATION_CYCLE = tuple(TRANSFORMATIONS)
 SYSTEM = """Complete the synthetic workspace tasks using the requested tools.
 Search for the exact task ID, read its file, then submit the matching record's
 revision and transformed payload. A file contains many distractor records.
-Transform EVERY word: move its first letter to the end and append 'ay'.
-Example: 'bright little lantern' -> 'rightbay ittlelay anternlay'.
-Use exactly word[1:] + word[0] + 'ay', even for vowels: 'ember' -> 'mbereay',
-'amber' -> 'mberaay'. Never add 'w' or apply conventional Pig Latin rules.
-Process every source word exactly once; the output word count must be unchanged.
-Keep word order and single spaces. Ignore read_padding; it is irrelevant filler.
-This is a mechanical text conversion. Use tool calls only; do not explain or plan.
+The read_file result specifies the transformation and instructions for that task.
+Apply ONLY that transformation to the target payload; do not combine operations
+or reuse the previous task's operation. Transform every source word exactly once.
+The output word count must be unchanged. Keep word order and single spaces.
+Ignore read_padding; it is irrelevant filler.
+These are mechanical text conversions. Use tool calls only; do not explain or plan.
 Continue with next_task_id even when ok is false; harness_continuation data
 is supplied to keep the workload moving after validation errors."""
 
@@ -891,7 +929,7 @@ def tool(name, description, properties):
 TOOLS = [
     tool("search_records", "Find the file containing an exact record ID.",
          {"id": {"type": "string"}}),
-    tool("read_file", "Read a workspace file containing many records.",
+    tool("read_file", "Read a workspace file and its task-specific transformation instructions.",
          {"path": {"type": "string"}}),
     tool("submit_result", "Submit the transformed payload of the target record.",
          {"id": {"type": "string"}, "revision": {"type": "integer"},
@@ -914,23 +952,47 @@ class Config:
     filler: bool = True
 
 
-def transform(text):
-    return " ".join(word[1:] + word[0] + "ay" for word in text.split())
+def transform(text, transformation="pig_latin"):
+    words = text.split()
+    if transformation == "pig_latin":
+        return " ".join(word[1:] + word[0] + "ay" for word in words)
+    if transformation == "reverse_words":
+        return " ".join(word[::-1] for word in words)
+    if transformation == "remove_vowels":
+        return " ".join("".join(char for char in word if char not in VOWELS) for word in words)
+    if transformation == "invert_case":
+        return " ".join(word.swapcase() for word in words)
+    raise ValueError(f"Unknown transformation: {transformation}")
 
 
-def make_session(config, session):
+def mixed_case(word, rng):
+    style = rng.randrange(4)
+    if style == 0:
+        return word
+    if style == 1:
+        return word.upper()
+    if style == 2:
+        return word.capitalize()
+    return "".join(char.upper() if index % 2 == 0 else char for index, char in enumerate(word))
+
+
+def make_session(config, session, task_offset=0):
     tasks = []
     for task_index in range(config.tasks):
+        transformation = TRANSFORMATION_CYCLE[(task_offset + task_index) % len(TRANSFORMATION_CYCLE)]
+        vocabulary = PIG_LATIN_WORDS if transformation == "pig_latin" else WORDS
         rng = random.Random(f"{VERSION}:{config.seed}:{session}:{task_index}:records")
         records = []
         for record_index in range(config.records):
-            records.append({
-                "id": f"record-{rng.getrandbits(64):016x}",
-                "revision": rng.randrange(1, 1000),
-                "payload": " ".join(rng.choices(WORDS, k=config.words)),
-            })
+            record_id = f"record-{rng.getrandbits(64):016x}"
+            revision = rng.randrange(1, 1000)
+            payload = rng.choices(vocabulary, k=config.words)
+            if transformation == "invert_case":
+                payload = [mixed_case(word, rng) for word in payload]
+            records.append({"id": record_id, "revision": revision, "payload": " ".join(payload)})
         target = records[rng.randrange(len(records))]
         tasks.append({"target": target, "path": f"/workspace/session-{session}/file-{task_index}.jsonl",
+                      "transformation": transformation, "instructions": TRANSFORMATIONS[transformation],
                       "contents": "\n".join(json.dumps(record) for record in records),
                       "padding_seed": f"{config.seed}:{session}:{task_index}:padding",
                       "read_padding": " ".join(random.Random(f"{config.seed}:{session}:{task_index}:padding").choices(
@@ -1112,6 +1174,7 @@ def run_session(client, config, tasks, session, state=None):
             task_ok, aborted = True, False
             dependency_ok, quality_credit, edit = True, 0.0, None
             target = task["target"]
+            transformation = task["transformation"]
             if compact_before:
                 messages = [{"role": "system", "content": SYSTEM},
                             {"role": "user", "content": f"Start with task ID {target['id']}."}]
@@ -1126,8 +1189,9 @@ def run_session(client, config, tasks, session, state=None):
             next_id = tasks[index + 1]["target"]["id"] if index + 1 < len(tasks) else None
             expected = [
                 ("search_records", {"id": target["id"]}, {"path": task["path"]}),
-                ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding}),
-                ("submit_result", {"id": target["id"], "revision": target["revision"], "text": transform(target["payload"])},
+                ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding,
+                 "transformation": transformation, "instructions": task["instructions"]}),
+                ("submit_result", {"id": target["id"], "revision": target["revision"], "text": transform(target["payload"], transformation)},
                  {"ok": True, "next_task_id": next_id}),
             ]
             for stage, arguments, result in expected:
@@ -1140,7 +1204,7 @@ def run_session(client, config, tasks, session, state=None):
                     if ui:
                         ui.lane(session, task=index + 1, stage=stage, attempt=attempt + 1, status="waiting")
                     entry = {"task": index + 1, "stage": stage, "attempt": attempt + 1,
-                             "padding_words": padding_words,
+                             "padding_words": padding_words, "transformation": transformation,
                              "tokens": {"available": False, "requests": 1}, "valid": False}
                     requests.append(entry)
                     request_started = time.perf_counter()
@@ -1223,7 +1287,7 @@ def run_session(client, config, tasks, session, state=None):
                     if issue:
                         entry["validation"] = issue
                         prefix = "FAIL" if exhausted else "RETRY"
-                        emit(client, f"{prefix} lane {session + 1} task {index + 1} {stage}: {issue['message']}")
+                        emit(client, f"{prefix} lane {session + 1} task {index + 1} {stage} ({transformation}): {issue['message']}")
                         if "expected_excerpt" in issue:
                             if ui and hasattr(ui, "difference"):
                                 ui.difference(issue["expected_excerpt"], issue["received_excerpt"])
@@ -1237,7 +1301,7 @@ def run_session(client, config, tasks, session, state=None):
                         entry["harness_continuation"] = True
                     else:
                         reply = {"error": issue["message"] + ". Re-read the task and tool results; try again. "
-                                 "Use exactly word[1:] + word[0] + 'ay' for every word, including vowels."}
+                                 "Apply only this task's transformation: " + task["instructions"]}
                     replayable = (call is not None and isinstance(call.get("id"), str)
                                   and isinstance(call.get("function"), dict)
                                   and isinstance(call["function"].get("name"), str)
@@ -1267,7 +1331,7 @@ def run_session(client, config, tasks, session, state=None):
                     break
             completed += int(task_ok)
             exercised += int(not aborted)
-            task_results.append({"task": index + 1, "correct": task_ok, "load_completed": not aborted,
+            task_results.append({"task": index + 1, "transformation": transformation, "correct": task_ok, "load_completed": not aborted,
                                  "quality_credit": quality_credit if dependency_ok and not aborted else 0.0,
                                  "read_padding_words": padding_words, "history_compacted_before": compact_before,
                                  "text_quality": edit})
@@ -1359,7 +1423,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0):
             while not finished.is_set() and not stop_requested(client):
                 seed = int.from_bytes(hashlib.sha256(f"{config.seed}:filler:{index}:{sequence}".encode()).digest()[:8], "big")
                 filler_config = replace(config, seed=seed, tasks=1, filler=False, filler_words=padding)
-                item = run_session(filler_client, filler_config, make_session(filler_config, index), index)
+                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index)
                 item.update({"filler": True, "seed": seed})
                 if item["mix_adjustments"]:
                     padding = item["mix_adjustments"][-1]["next_padding_words"]
@@ -1782,6 +1846,8 @@ def run_benchmark(args, client, config):
               "unmeasured_lanes": [n for n in args.lanes if str(n) not in summaries],
               "requested_lanes": args.lanes,
               "config": asdict(config), "cache_policy": args.cache_policy,
+              "transformation_cycle": list(TRANSFORMATION_CYCLE), "vocabulary_words": len(WORDS),
+              "pig_latin_vocabulary_words": len(PIG_LATIN_WORDS),
               "model_context": context_info,
               "requested_config": asdict(requested_config), "calibration": calibration,
               "target_fresh_per_output": TARGET_RATIO, "ratio_tolerance": args.ratio_tolerance,
