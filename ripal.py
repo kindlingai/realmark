@@ -5,6 +5,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 import argparse
@@ -273,16 +274,21 @@ def phase_timing(response, tokens):
             "output_tokens": tokens.get("output_tokens")}
 
 
-def average_phases(sessions):
+def average_phases(sessions, lanes=1):
     completed = [request for session in sessions for request in session.get("requests", [])
                  if request.get("received_response") and not request.get("cancelled")]
     samples = [r["phase_timing"] for r in completed if r.get("phase_timing")]
     prefill = [s for s in samples if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
     decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
+    prefill_rate = sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None
+    decode_rate = sum(s["output_tokens"] - 1 for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
     return {
         "source": "streaming estimates; visible deltas may be buffered",
-        "prefill_tokens_per_second": sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None,
-        "decode_tokens_per_second": sum(s["output_tokens"] - 1 for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None,
+        "prefill_tokens_per_second": prefill_rate,
+        "decode_tokens_per_second": decode_rate,
+        "aggregate_prefill_tokens_per_second": lanes * prefill_rate if prefill_rate is not None else None,
+        "aggregate_decode_tokens_per_second": lanes * decode_rate if decode_rate is not None else None,
+        "aggregate_method": "concurrency times time-weighted per-request phase estimate",
         "prefill_samples": len(prefill), "decode_samples": len(decode),
         "average_tool_seconds": sum(r["seconds"] for r in completed) / len(completed) if completed else None,
         "average_completion_seconds": sum(s["seconds"] for s in sessions) / len(sessions) if sessions else None,
@@ -304,6 +310,37 @@ STYLES = {"0": CREAM, "1": "1;" + CREAM, "2": MUTED,
 
 def safe_text(value):
     return "".join(c if c >= " " and c != "\x7f" else " " for c in str(value))
+
+
+def difference_lines(expected, received, color=False, width=110, prefix=""):
+    """Style only changed characters; clipping happens before ANSI styling."""
+    expected, received = safe_text(repr(expected)), safe_text(repr(received))
+    sides = [[], []]
+    for tag, a, b, c, d in SequenceMatcher(None, expected, received, autojunk=False).get_opcodes():
+        sides[0].append((expected[a:b] or "∅", tag != "equal"))
+        sides[1].append((received[c:d] or "∅", tag != "equal"))
+    lines = []
+    for label, spans, foreground in zip(("expected", "received"), sides, (AMBER, ORANGE)):
+        parts = [(f"  {safe_text(prefix)}{label}: ", False)] + spans
+        remaining = max(1, width - 1)
+        rendered, used = [], 0
+        for text, changed in parts:
+            if not color and changed:
+                text = "[" + text + "]"
+            text = text[:remaining]
+            remaining -= len(text)
+            used += len(text)
+            if color:
+                style = f"1;4;{foreground};48;2;65;43;25" if changed else f"{BACKGROUND};{MUTED}"
+                rendered.append(f"\x1b[{style}m{text}")
+            else:
+                rendered.append(text)
+            if not remaining:
+                break
+        if color:
+            rendered.append(f"\x1b[{BACKGROUND};{MUTED}m" + " " * max(0, width - 1 - used) + "\x1b[0m")
+        lines.append("".join(rendered))
+    return lines
 
 
 class TerminalUI:
@@ -396,6 +433,16 @@ class TerminalUI:
                 self.stream.write(message + "\n")
                 self.stream.flush()
 
+    def difference(self, expected, received, prefix=""):
+        event = {"kind": "difference", "expected": str(expected),
+                 "received": str(received), "prefix": safe_text(prefix)}
+        with self.lock:
+            self.events.append(event)
+            if not self.live:
+                width = shutil.get_terminal_size((110, 32)).columns
+                self.stream.write("\n".join(difference_lines(expected, received, self.color, width, prefix)) + "\n")
+                self.stream.flush()
+
     def render(self, width=110, height=32, now=None):
         now = time.perf_counter() if now is None else now
         with self.lock:
@@ -433,7 +480,18 @@ class TerminalUI:
         if len(lanes) > visible:
             lines.append(paint(f"… {len(lanes) - visible} additional lanes", "2"))
         lines.extend(["", paint("RECENT EVENTS", "1;34")])
-        lines.extend(paint("  " + event, "31" if "FAIL" in event or "mismatch" in event else "2") for event in events)
+        groups = []
+        count = 0
+        for event in reversed(events):
+            group = (difference_lines(event["expected"], event["received"], self.color, width, event["prefix"])
+                     if isinstance(event, dict) and event.get("kind") == "difference" else
+                     [paint("  " + event, "31" if "FAIL" in event or "mismatch" in event else "2")])
+            if count + len(group) > 6:
+                break
+            groups.append(group)
+            count += len(group)
+        for group in reversed(groups):
+            lines.extend(group)
         lines.extend(["", paint("Request age includes queueing + prefill + decode. Streaming samples timing; final usage gives token totals.", "2")])
         return "\n".join(line if line else paint("") for line in lines[:max(1, height - 1)])
 
@@ -473,6 +531,22 @@ class TerminalUI:
             self.stream.write("\x1b[H" + self.render(size.columns, size.lines).replace("\n", "\x1b[K\n") + "\x1b[K\x1b[J")
             self.stream.flush()
             self.stop.wait(.15)
+
+
+def api_error_counts(sessions):
+    counts = {}
+    for session in sessions:
+        for request in session.get("requests", []):
+            kind = request.get("validation", {}).get("kind")
+            if kind in {"transport_error", "tool_timeout", "server_overload"}:
+                counts[kind] = counts.get(kind, 0) + 1
+    return counts
+
+
+def aggregate_phase(summary, lanes, key):
+    phases = summary.get("phase_averages", {})
+    value = phases.get(key)
+    return phases.get("aggregate_" + key, int(lanes) * value if value is not None else None)
 
 
 def braille_plot(points, width=32, height=4):
@@ -559,10 +633,6 @@ def result_card(report, width=98):
     heading = ("RIPAL PARTIAL RESULTS — SERVER OVERWHELMED" if report.get("termination_kind") == "overload" else
                "RIPAL PARTIAL RESULTS — INTERRUPTED" if report.get("interrupted") else "RIPAL RESULTS")
     add(f"{heading}  ·  {report['model']}")
-    add(report.get("base_url", ""))
-    warmup_tasks = report.get("measurement", {}).get("warmup_tasks_per_lane")
-    if warmup_tasks is not None:
-        add(f"Warmup: {warmup_tasks} task(s)/lane per profile · excluded from scores")
     if report.get("terminated") or report.get("interrupted"):
         if report.get("termination_reason"):
             add("Stopped: " + report["termination_reason"])
@@ -583,79 +653,57 @@ def result_card(report, width=98):
         if report.get("unmeasured_lanes"):
             add("Not measured: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
     add()
-    add("Lanes  Load score    Match   Failed tasks  Resp.err    Mix")
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
+    show_api_errors = any(s.get("api_errors", 0) for _, s in summaries)
+    add("Lanes  Load score    Match   Completed" + ("   API errors" if show_api_errors else "") + "       Mix")
     for lanes, summary in summaries:
         def number(value):
             return f"{value:,.1f}" if value is not None else "—"
         ratio = summary["token_mix"].get("fresh_per_output")
         approximate = summary.get("mix_excludes_cancelled_filler_usage", False)
         mix = ("~" if approximate else "") + f"{ratio:.2f}:1" if ratio is not None else "unknown"
-        marker = "" if summary["valid"] and not summary.get("response_failures") else "*"
+        planned = summary.get("planned_tasks", 0)
+        completed = summary.get("load_completed_tasks", planned)
         quality = summary.get("edit_quality")
         match = f"{quality:.1%}" if quality is not None else "—"
-        add(f"{int(lanes):>3}L {number(summary['score']) + marker:>10}  {match:>7}  "
-            f"{summary.get('failed_tasks', 0):>4}/{summary.get('planned_tasks', 0):<5}  "
-            f"{summary.get('response_failures', 0):>6}  {mix:>9}")
+        add(f"{int(lanes):>3}L {number(summary['score']):>10}  {match:>7}  "
+            f"{completed:>4}/{planned:<5}" +
+            (f"  {summary.get('api_errors', 0):>10}" if show_api_errors else "") + f"  {mix:>9}")
     add()
     if summaries:
-        add("C      Prefill~ tok/s    Decode~ tok/s    Avg completion s    Batch s")
+        add("C    Prefill~ total (each)    Decode~ total (each)    Complete s   Batch s")
         for lanes, summary in summaries:
             phases = summary.get("phase_averages", {})
             def metric(value):
                 return f"{value:,.2f}" if value is not None else "—"
-            add(f"{int(lanes):>2}L {metric(phases.get('prefill_tokens_per_second')):>16} "
-                f"{metric(phases.get('decode_tokens_per_second')):>16} "
-                f"{metric(phases.get('average_completion_seconds')):>19} "
-                f"{metric(summary.get('mean_seconds')):>10}")
-        add("~ Streaming estimates per request; prefill includes queue/network delay.")
+            def rate(key):
+                each = phases.get(key)
+                total = aggregate_phase(summary, lanes, key)
+                return f"{total:,.1f} ({each:,.1f})" if each is not None and total is not None else "—"
+            add(f"{int(lanes):>2}L {rate('prefill_tokens_per_second'):>23} "
+                f"{rate('decode_tokens_per_second'):>24} "
+                f"{metric(phases.get('average_completion_seconds')):>12} "
+                f"{metric(summary.get('mean_seconds')):>9}")
         add()
         plot = report.get("score_plot") or braille_plot([(int(n), s["score"]) for n, s in summaries])
         for line in chart_lines(plot, "Load score", "points"):
             add(line)
-        for key, title in (("decode_tokens_per_second", "Average decode~"),
-                           ("prefill_tokens_per_second", "Average prefill~")):
+        for key, title in (("decode_tokens_per_second", "Total decode~"),
+                           ("prefill_tokens_per_second", "Total prefill~")):
             add()
-            metric_plot = report.get("metric_plots", {}).get(key) or braille_plot([
-                (int(n), summary.get("phase_averages", {}).get(key)) for n, summary in summaries])
+            metric_plot = report.get("metric_plots", {}).get("aggregate_" + key) or braille_plot([
+                (int(n), aggregate_phase(summary, n, key)) for n, summary in summaries])
             for line in chart_lines(metric_plot, title, "tok/s"):
                 add(line)
     else:
         add("No measured scores available.")
     add()
     calibration = report.get("calibration", {})
-    calibration_failures = sum(r["session"].get("failed_tasks", 0) for r in calibration.get("rounds", []))
-    warmup_failures = sum(s.get("failed_tasks", 0) for r in report.get("warmup_runs", []) for s in r["sessions"])
-    add(f"Failed tasks outside scoring: calibration {calibration_failures} · warmups {warmup_failures}")
-    filler_tasks = sum(s.get("filler_completed_tasks", 0) for _, s in summaries)
-    filler_errors = sum(s.get("filler_response_failures", 0) for _, s in summaries)
-    filler_cancelled = sum(s.get("filler_cancelled_requests", 0) for _, s in summaries)
-    if filler_tasks or filler_cancelled or filler_errors:
-        add(f"Unscored filler: {filler_tasks} tasks · {filler_errors} response errors · {filler_cancelled} cancelled tails")
-        add("~ Token ratio uses received responses; cancelled filler usage is unknown.")
-    add("Load score: completed cycles. Match: edit-distance quality credit.")
-    add("* Errors or unverified mix. Timing CIs and full details are in JSON.")
-    if report.get("measurement", {}).get("mix_control") == "adaptive":
-        all_sessions = [r["session"] for r in calibration.get("rounds", [])]
-        all_sessions += [s for r in report.get("warmup_runs", []) + report.get("runs", [])
-                         for s in r["sessions"] + r.get("filler_sessions", [])]
-        compactions = sum(t.get("history_compacted_before", False) for s in all_sessions for t in s.get("task_results", []))
-        adjustments = sum(e["next_padding_words"] != e["padding_words"] for s in all_sessions for e in s.get("mix_adjustments", []))
-        add(f"Adaptive mix (all phases): {adjustments} padding changes · {compactions} compactions")
     if calibration.get("error"):
         add("Calibration: " + calibration["error"])
-    failures = {}
-    for run in report.get("runs", []):
-        for session in run["sessions"]:
-            for request in session.get("requests", []):
-                issue = request.get("validation")
-                if issue:
-                    key = issue.get("kind", "unknown")
-                    failures[key] = failures.get(key, 0) + 1
+    failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
-        add("Response failures: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
-    if report.get("results_path"):
-        add("JSON: " + report["results_path"])
+        add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
     return "\n".join(["╭" + "─" * (width - 2) + "╮"] +
                      ["│ " + line.ljust(width - 4) + " │" for line in body] +
                      ["╰" + "─" * (width - 2) + "╯"])
@@ -679,6 +727,9 @@ class FillerProgress:
 
     def log(self, *args, **kwargs):
         self.ui.log(*args, **kwargs)
+
+    def difference(self, expected, received):
+        self.ui.difference(expected, received, prefix="FILLER ")
 
 
 class FillerClient:
@@ -1018,7 +1069,10 @@ def run_session(client, config, tasks, session):
                         prefix = "FAIL" if exhausted else "RETRY"
                         emit(client, f"{prefix} lane {session + 1} task {index + 1} {stage}: {issue['message']}")
                         if "expected_excerpt" in issue:
-                            emit(client, f"  expected: {issue['expected_excerpt']!r} | received: {issue['received_excerpt']!r}")
+                            if ui and hasattr(ui, "difference"):
+                                ui.difference(issue["expected_excerpt"], issue["received_excerpt"])
+                            else:
+                                emit(client, f"  expected: {issue['expected_excerpt']!r} | received: {issue['received_excerpt']!r}")
                     if issue is None:
                         reply = result
                     elif exhausted and not config.strict and received:
@@ -1261,7 +1315,8 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
             "score_status": "interrupted_partial" if interrupted else "verified" if valid else "with_failures_or_unverified_mix",
             "planned_tasks": planned, "passed_tasks": passed, "failed_tasks": failed,
             "task_accuracy": accuracy,
-            "phase_averages": average_phases(sessions),
+            "phase_averages": average_phases(sessions, lanes),
+            "api_errors": sum(api_error_counts(sessions).values()),
             "edit_quality": quality,
             "text_edit_distance": sum(task["text_quality"]["distance"] for s in sessions
                                       for task in s.get("task_results", []) if task.get("text_quality")),
@@ -1301,7 +1356,10 @@ def positive(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
-    parser.add_argument("--model", required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--model")
+    source.add_argument("--render", type=Path, help="Re-render a saved JSON datafile offline; leaves the datafile unchanged")
+    parser.add_argument("--card-output", type=Path, help="Save the re-rendered plain-text card (requires --render)")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY",
                         help="API key environment variable (default OPENAI_API_KEY); never saved in results")
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
@@ -1341,6 +1399,13 @@ def main():
                         help="Use non-streaming responses; separate prefill/decode estimates will be unavailable")
     parser.add_argument("--output", type=Path, default=Path("ripal-results.json"))
     args = parser.parse_args()
+    if args.render:
+        try:
+            return render_saved_report(args)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"Could not render {args.render}: {exc}")
+    if args.card_output:
+        parser.error("--card-output requires --render")
     if args.retries < 0 or args.warmup_tasks < 0 or args.calibration_rounds < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("retries and warmup-tasks must be nonnegative; timeout must be positive and finite")
     if args.filler_words < 0 or not math.isfinite(args.ratio_tolerance) or not 0 < args.ratio_tolerance < 1:
@@ -1523,17 +1588,41 @@ def run_benchmark(args, client, config):
     return 0 if any(summary["load_completed_tasks"] > 0 for summary in summaries.values()) else 1
 
 
+def refresh_report_charts(report):
+    if report.get("summaries"):
+        report["score_plot"] = braille_plot([(n, report["summaries"].get(str(n), {}).get("score"))
+            for n in report.get("requested_lanes", [int(n) for n in report["summaries"]])])
+        report["metric_plots"] = {"aggregate_" + key: braille_plot([(int(n), aggregate_phase(s, n, key))
+            for n, s in report["summaries"].items()])
+            for key in ("decode_tokens_per_second", "prefill_tokens_per_second")}
+
+
+def render_saved_report(args):
+    if args.card_output and args.card_output.resolve() == args.render.resolve():
+        raise ValueError("Card output must differ from the input JSON datafile")
+    report = json.loads(args.render.read_text())
+    if not isinstance(report, dict):
+        raise ValueError("Expected a benchmark report object")
+    report["results_path"] = str(args.render.resolve())
+    for level, summary in report.get("summaries", {}).items():
+        sessions = [s for run in report.get("runs", []) if str(run["lanes"]) == str(level) for s in run["sessions"]]
+        if sessions:
+            summary["api_errors"] = sum(api_error_counts(sessions).values())
+    refresh_report_charts(report)
+    card = result_card(report, width=min(98, shutil.get_terminal_size((100, 32)).columns - 1))
+    if args.card_output:
+        args.card_output.write_text(card + "\n")
+    ui = TerminalUI(report.get("model", "saved run"), report.get("base_url", ""), mode="plain", color=args.color)
+    ui.card(card)
+    return 0
+
+
 def write_results(args, client, report):
     if stop_requested(client):
         report.update(termination_state(client))
     report["results_path"] = str(args.output.resolve())
     card_path = args.output.with_suffix(".card.txt")
-    if report.get("summaries"):
-        report["score_plot"] = braille_plot([(n, report["summaries"].get(str(n), {}).get("score"))
-            for n in report.get("requested_lanes", [int(n) for n in report["summaries"]])])
-        report["metric_plots"] = {key: braille_plot([(int(n), s.get("phase_averages", {}).get(key))
-            for n, s in report["summaries"].items()])
-            for key in ("decode_tokens_per_second", "prefill_tokens_per_second")}
+    refresh_report_charts(report)
     width = min(98, shutil.get_terminal_size((100, 32)).columns - 1)
     report["final_card"] = result_card(report, width=width)
     report["card_path"] = str(card_path.resolve())
