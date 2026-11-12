@@ -449,7 +449,7 @@ def result_card(report, width=98):
         add(f"Observed tokens across all phases: fresh {fresh:,} · decode {output:,}")
         add("Partial batch scores are provisional; unfinished work gets no credit.")
         if report.get("unmeasured_lanes"):
-            add("Not reached: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
+            add("Not measured: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
     add()
     add("Lanes  Load score  Edit.score   Match   Failed tasks  Resp.err    Mix")
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
@@ -490,9 +490,12 @@ def result_card(report, width=98):
     add("Load score: completed cycles. Edit score: similarity-weighted work.")
     add("* Errors or unverified mix. Timing CIs and full details are in JSON.")
     if report.get("measurement", {}).get("mix_control") == "adaptive":
-        compactions = sum(s.get("history_compactions", 0) for _, s in summaries)
-        adjustments = sum(s.get("padding_adjustments", 0) for _, s in summaries)
-        add(f"Adaptive mix: {adjustments} padding adjustments · {compactions} history compactions")
+        all_sessions = [r["session"] for r in calibration.get("rounds", [])]
+        all_sessions += [s for r in report.get("warmup_runs", []) + report.get("runs", [])
+                         for s in r["sessions"] + r.get("filler_sessions", [])]
+        compactions = sum(t.get("history_compacted_before", False) for s in all_sessions for t in s.get("task_results", []))
+        adjustments = sum(e["next_padding_words"] != e["padding_words"] for s in all_sessions for e in s.get("mix_adjustments", []))
+        add(f"Adaptive mix (all phases): {adjustments} padding changes · {compactions} compactions")
     if calibration.get("error"):
         add("Calibration: " + calibration["error"])
     failures = {}
@@ -1194,6 +1197,18 @@ def main():
             return run_benchmark(args, client, config)
 
 
+def batch_schedule(lanes, repeats, warmup_tasks):
+    """Measure each level before warming the next, potentially larger level."""
+    for level in lanes:
+        if warmup_tasks:
+            yield True, 0, level
+        yield False, 0, level
+    for repeat in range(1, repeats):
+        offset = repeat % len(lanes)
+        for level in lanes[offset:] + lanes[:offset]:
+            yield False, repeat, level
+
+
 def run_benchmark(args, client, config):
     requested_config = config
     calibration = {"source": "warmup_tasks", "skipped": args.warmup_tasks == 0, "valid": False, "rounds": [], "warmup_profiles": []}
@@ -1222,52 +1237,46 @@ def run_benchmark(args, client, config):
     runs = []
     warmups = []
     profile_padding = {lanes: config.filler_words for lanes in args.lanes}
-    schedule = ([(True, 0)] if args.warmup_tasks else []) + [(False, repeat) for repeat in range(args.repeats)]
-    for round_index, (is_warmup, repeat) in enumerate(schedule):
+    for is_warmup, repeat, lanes in batch_schedule(args.lanes, args.repeats, args.warmup_tasks):
         if stop_requested(client):
             break
-        offset = round_index % len(args.lanes)
-        order = args.lanes[offset:] + args.lanes[:offset]
-        for lanes in order:
-            if stop_requested(client):
-                break
-            # Fresh content per profile/repetition, deterministic across models.
-            seed_text = f"{args.seed}:{'warmup' if is_warmup else 'measured'}:{repeat}:{lanes}"
-            batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
-            batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes],
-                                   tasks=args.warmup_tasks if is_warmup else config.tasks,
-                                   filler=False if is_warmup else config.filler)
-            phase = (f"Warmup {batch_config.tasks} task(s)/lane" if is_warmup else
-                     f"Measured repeat {repeat + 1}/{args.repeats}")
-            ui = getattr(client, "progress", None)
-            if ui:
-                ui.begin(f"RIPAL-{lanes}L · {phase}", lanes, batch_config.tasks, batch_config.filler_words)
-            workload = [make_session(batch_config, index) for index in range(lanes)]
-            run = run_profile(client, batch_config, workload, lanes)
-            run["repeat"] = repeat + 1
-            run["tasks_per_session"] = batch_config.tasks
-            run["initial_padding_words"] = batch_config.filler_words
-            next_padding = [s["mix_adjustments"][-1]["next_padding_words"] for s in run["sessions"] if s.get("mix_adjustments")]
-            if config.adaptive_mix and next_padding:
-                profile_padding[lanes] = round(statistics.median(next_padding))
-            run["next_batch_padding_words"] = profile_padding[lanes]
-            if is_warmup:
-                calibration.setdefault("warmup_profiles", []).append({"lanes": lanes,
-                    "initial_padding_words": batch_config.filler_words, "next_padding_words": profile_padding[lanes],
-                    "token_mix": run["token_mix"]})
-                calibration["valid"] = all(mix_matches(p["token_mix"], TARGET_RATIO, args.ratio_tolerance)
-                                            for p in calibration["warmup_profiles"])
-            run["seed"] = batch_seed
-            run["workload_sha256"] = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
-            (warmups if is_warmup else runs).append(run)
-            points = f"{run['score']:.1f}" if run["score"] is not None else "unavailable"
-            phase = "warmup" if is_warmup else "measured"
-            failed_tasks = sum(s["failed_tasks"] for s in run["sessions"])
-            emit(client, f"RIPAL-{lanes}L {phase}={repeat + 1} seconds={run['seconds']:.3f} "
-                 f"provisional_load_score={points} failed_tasks={failed_tasks}")
-            for session in run["sessions"]:
-                if session["error"]:
-                    emit(client, f"  session={session['session']}: {session['error']}")
+        # Fresh content per profile/repetition, deterministic across models.
+        seed_text = f"{args.seed}:{'warmup' if is_warmup else 'measured'}:{repeat}:{lanes}"
+        batch_seed = int.from_bytes(hashlib.sha256(seed_text.encode()).digest()[:8], "big")
+        batch_config = replace(config, seed=batch_seed, filler_words=profile_padding[lanes],
+                               tasks=args.warmup_tasks if is_warmup else config.tasks,
+                               filler=False if is_warmup else config.filler)
+        phase = (f"Warmup {batch_config.tasks} task(s)/lane" if is_warmup else
+                 f"Measured repeat {repeat + 1}/{args.repeats}")
+        ui = getattr(client, "progress", None)
+        if ui:
+            ui.begin(f"RIPAL-{lanes}L · {phase}", lanes, batch_config.tasks, batch_config.filler_words)
+        workload = [make_session(batch_config, index) for index in range(lanes)]
+        run = run_profile(client, batch_config, workload, lanes)
+        run["repeat"] = repeat + 1
+        run["tasks_per_session"] = batch_config.tasks
+        run["initial_padding_words"] = batch_config.filler_words
+        next_padding = [s["mix_adjustments"][-1]["next_padding_words"] for s in run["sessions"] if s.get("mix_adjustments")]
+        if config.adaptive_mix and next_padding:
+            profile_padding[lanes] = round(statistics.median(next_padding))
+        run["next_batch_padding_words"] = profile_padding[lanes]
+        if is_warmup:
+            calibration.setdefault("warmup_profiles", []).append({"lanes": lanes,
+                "initial_padding_words": batch_config.filler_words, "next_padding_words": profile_padding[lanes],
+                "token_mix": run["token_mix"]})
+            calibration["valid"] = all(mix_matches(p["token_mix"], TARGET_RATIO, args.ratio_tolerance)
+                                        for p in calibration["warmup_profiles"])
+        run["seed"] = batch_seed
+        run["workload_sha256"] = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
+        (warmups if is_warmup else runs).append(run)
+        points = f"{run['score']:.1f}" if run["score"] is not None else "unavailable"
+        phase = "warmup" if is_warmup else "measured"
+        failed_tasks = sum(s["failed_tasks"] for s in run["sessions"])
+        emit(client, f"RIPAL-{lanes}L {phase}={repeat + 1} seconds={run['seconds']:.3f} "
+             f"provisional_load_score={points} failed_tasks={failed_tasks}")
+        for session in run["sessions"]:
+            if session["error"]:
+                emit(client, f"  session={session['session']}: {session['error']}")
     summaries = {}
     for lanes in args.lanes:
         group = [run for run in runs if run["lanes"] == lanes]
