@@ -477,13 +477,32 @@ def average_phases(sessions, lanes=1):
     decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
     prefill_rate = sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None
     decode_rate = sum(s["output_tokens"] - 1 for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
-    prefill_values = [s["fresh_tokens"] / s["first_output_seconds"] for s in prefill]
-    decode_values = [(s["output_tokens"] - 1) / s["generation_seconds"] for s in decode]
+    task_samples = []
+    for session in sessions:
+        finished = {t["task"] for t in session.get("task_results", []) if t.get("load_completed")}
+        grouped = {}
+        for request in session.get("requests", []):
+            task = request.get("task")
+            if (task not in finished or not request.get("received_response") or request.get("cancelled")
+                    or not request.get("phase_timing")):
+                continue
+            grouped.setdefault(task, []).append(request["phase_timing"])
+        task_samples.extend(grouped.values())
+    prefill_values, decode_values = [], []
+    for task in task_samples:
+        inputs = [s for s in task if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
+        outputs = [s for s in task if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
+        if inputs:
+            prefill_values.append(sum(s["fresh_tokens"] for s in inputs) / sum(s["first_output_seconds"] for s in inputs))
+        if outputs:
+            decode_values.append(sum(s["output_tokens"] - 1 for s in outputs) / sum(s["generation_seconds"] for s in outputs))
     return {
         "prefill_stdev": statistics.stdev(prefill_values) if len(prefill_values) > 1 else None,
         "decode_stdev": statistics.stdev(decode_values) if len(decode_values) > 1 else None,
         "aggregate_prefill_stdev": lanes * statistics.stdev(prefill_values) if len(prefill_values) > 1 else None,
         "aggregate_decode_stdev": lanes * statistics.stdev(decode_values) if len(decode_values) > 1 else None,
+        "stdev_source": "completed task phase rates; requests combined within each task",
+        "prefill_stdev_samples": len(prefill_values), "decode_stdev_samples": len(decode_values),
         "source": "streaming estimates; visible deltas may be buffered",
         "prefill_tokens_per_second": prefill_rate,
         "decode_tokens_per_second": decode_rate,
@@ -2570,19 +2589,16 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
                              if s.get("time_limited") else s["seconds"] for s in sessions]
     quality_credit = sum(s.get("quality_word_credit", s.get("quality_credit", s.get("completed_tasks", 0)) * 256) for s in sessions)
     edit_score = score(quality_credit / len(runs) / SCORE_WORDS, mean) if scored and quality is not None else None
-    score_samples = [score(run["effective_sessions"], run["seconds"]) for run in runs if "effective_sessions" in run]
-    sigma_source = "repeated batch scores"
-    if len(score_samples) < 2:
-        score_samples = []
-        sigma_source = "concurrency-scaled measured task throughput"
-        for session in sessions:
-            previous = 0
-            for task in session.get("task_results", []):
-                finished = task.get("finished_seconds", previous)
-                duration = finished - previous
-                if task.get("load_completed") and duration > 0:
-                    score_samples.append(score(lanes * task.get("load_words", 0) / SCORE_WORDS, duration))
-                previous = finished
+    score_samples = []
+    sigma_source = "concurrency-scaled measured task throughput"
+    for session in sessions:
+        previous = 0
+        for task in session.get("task_results", []):
+            finished = task.get("finished_seconds", previous)
+            duration = finished - previous
+            if task.get("load_completed") and duration > 0:
+                score_samples.append(score(lanes * task.get("load_words", 0) / SCORE_WORDS, duration))
+            previous = finished
     return {"profile": f"RIPAL-{lanes}L", "valid": valid, "measured_runs": len(runs),
             "interrupted": interrupted, "time_limited": time_limited,
             "score_stdev": statistics.stdev(score_samples) if len(score_samples) > 1 else None,

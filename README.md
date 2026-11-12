@@ -52,8 +52,9 @@ charts are recomputed on render. Old processed-result files are unsupported.
 Defaults to `realmark-MODEL.json` and `realmark-MODEL.card.txt`; model names are
 sanitized for filenames. `--output PATH` overrides the filename. The `.card.txt`
 contains the rendered result.
-Graph bars show ±1 sample SD: batch scores across repeats, otherwise task-rate
-variation; streaming-rate variation across requests. Missing SD is omitted.
+Graph bars show ±1 sample SD across completed tasks only. Prefill/decode samples
+combine token totals and phase durations across each task’s requests. Fewer than
+two completed task samples omit the SD; warmups and partial tasks are excluded.
 Y bounds round outward to two significant digits, with the minimum clamped to zero.
 Points/error bars at that boundary overwrite the horizontal axis.
 
