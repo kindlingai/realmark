@@ -939,8 +939,9 @@ def card_rate(summary, lanes, key, width):
 
 
 def context_series(report):
-    """(prompt tokens, match %) per measured task at every C, and
-    (prompt tokens, fresh tokens, seconds to first output) per measured C=1 request."""
+    """(prompt tokens, transformation %, match %) per measured task at every C, and
+    (prompt tokens, fresh tokens, seconds to first output) per measured C=1 request.
+    The transformation % is None where the task earned no credit."""
     quality, prefill = [], []
     for run in report.get("runs", []):
         for session in run["sessions"]:
@@ -957,7 +958,9 @@ def context_series(report):
                     prefill.append((prompt, timing["fresh_tokens"], timing["first_output_seconds"]))
             for task in session.get("task_results", []):
                 if task["task"] in submits and task.get("load_completed"):
-                    quality.append((submits[task["task"]], 100 * task.get("quality_credit", 0)))
+                    transformed = task.get("transform_score")
+                    quality.append((submits[task["task"]], None if transformed is None else 100 * transformed,
+                                    100 * task.get("quality_credit", 0)))
     return quality, prefill
 
 
@@ -976,38 +979,47 @@ def context_grid(report, width):
     gap = 3
     left_width = (width - gap) // 2
     right_width = width - gap - left_width
-    def chart(samples, reduce, title, unit, size, y_range=None, marks=()):
-        """`marks` are contexts drawn as an x on the baseline instead of joining the line."""
+    def chart(samples, reduce, title, unit, size, y_range=None, overlay=None):
+        """`overlay(rows, column_of, row_of)` may draw on the finished plot."""
         if len(samples) < 2:
             return [title, "Not enough measured data."]
-        bounds = (min(c for c in [s[0] for s in samples] + list(marks)), max(c for c in [s[0] for s in samples] + list(marks)))
+        bounds = (min(s[0] for s in samples), max(s[0] for s in samples))
         def plot(columns):
-            points, low, high = bucket_points(samples, columns, reduce, bounds)
+            points, low, high = bucket_points([s for s in samples if s[1] is not None], columns, reduce, bounds)
             # Empty buckets are skipped, so the line joins the buckets on either side.
-            result = braille_plot([p for p in points if p[1] is not None], width=columns, height=4, label=context_label,
+            known = [p for p in points if p[1] is not None] or [(low, None), (high, None)]
+            result = braille_plot(known, width=columns, height=4, label=context_label,
                                   ticks=[low, (low + high) / 2, high], x_range=(low, high), y_range=y_range)
-            known = [p for p in points if p[1] is not None]
-            rows = [list(line) for line in result["lines"] + [result["baseline"]]]
-            for context in marks:
-                column = min(columns - 1, round((context - low) / ((high - low) or 1) * (2 * columns - 1)) // 2)
-                # The x sits on the line, at the value interpolated between the neighbouring buckets.
-                before = [p for p in known if p[0] <= context][-1:] or known[:1]
-                after = [p for p in known if p[0] >= context][:1] or known[-1:]
-                if not before:
-                    continue
-                (x0, y0), (x1, y1) = before[0], after[0]
-                value = y0 if x1 == x0 else y0 + (y1 - y0) * (context - x0) / (x1 - x0)
-                pixel = round((result["y_max"] - value) / ((result["y_max"] - result["y_min"]) or 1) * 4 * len(result["lines"]))
-                rows[min(len(rows) - 1, max(0, pixel // 4))][column] = "x"
-            result["lines"], result["baseline"] = ["".join(row) for row in rows[:-1]], "".join(rows[-1])
+            if overlay:
+                result["has_data"] = True
+                rows = [list(line) for line in result["lines"] + [result["baseline"]]]
+                def column_of(context):
+                    return min(columns - 1, round((context - low) / ((high - low) or 1) * (2 * columns - 1)) // 2)
+                def row_of(value):
+                    pixel = round((result["y_max"] - value) / ((result["y_max"] - result["y_min"]) or 1)
+                                  * 4 * len(result["lines"]))
+                    return min(len(rows) - 1, max(0, pixel // 4))
+                overlay(rows, column_of, row_of)
+                result["lines"], result["baseline"] = ["".join(row) for row in rows[:-1]], "".join(rows[-1])
             return result
         first = plot(max(1, size - 2))
         gutter = max(*map(len, axis_labels(first)), len(middle_label(first)))
         return chart_lines(plot(max(1, size - gutter - 2)), title, unit, "")
-    # Zero-match tasks (lookup misses, wrong records) would drag bucket means to nothing; they are marked instead.
-    left = chart([q for q in quality if q[1] > 0], lambda group: statistics.mean(v for _, v in group),
-                 "Match by context (t)", "mean %, x = 0%", left_width, (0, 100),
-                 [context for context, value in quality if value == 0])
+    def penalties(rows, column_of, row_of):
+        """Per chart column: a full column of x where a task earned nothing, else an x at the mean match of
+        the tasks a record error cut below their transformation score."""
+        columns = {}
+        for context, transformed, credit in quality:
+            columns.setdefault(column_of(context), []).append((transformed, credit))
+        for column, tasks in columns.items():
+            partial = [credit for transformed, credit in tasks if transformed is not None and credit < transformed]
+            if any(credit == 0 for _, credit in tasks):
+                for row in rows:
+                    row[column] = "x"
+            elif partial:
+                rows[row_of(statistics.mean(partial))][column] = "x"
+    left = chart(quality, lambda group: statistics.mean(t for _, t, _ in group),
+                 "Transformation by context (t)", "mean %, x = match", left_width, (0, 100), penalties)
     right = chart(prefill, lambda group: sum(f for _, f, _ in group) / sum(s for _, _, s in group),
                   "Prefill by context (t)", "t/s, C=1", right_width)
     height = max(len(left), len(right))
@@ -1572,34 +1584,57 @@ def repeated_output(words, expected):
 # Below this, a block-aligned cache can legitimately hit under half of the previous prompt.
 CACHE_MISS_MIN_PROMPT = 32768
 RECORD_MISMATCH_NOTES = {
-    'distractor': 'Lookup miss (submitted a distractor record)',
-    'distractor_text': "Mixed records (submitted the target's ID with a distractor's text)",
-    'revision': 'Wrong revision (submitted the target with the wrong revision)',
-    'unknown_id': 'Unknown record (submitted an ID that is not in the file)',
+    'distractor': 'Lookup miss (submitted a distractor record; half credit)',
+    'distractor_text': "Mixed records (submitted the target's ID with a distractor's text; half credit)",
+    'revision': 'Wrong revision (submitted the target with the wrong revision; half credit)',
+    'unknown_id': 'Unknown record (submitted an ID that is not in the file; half credit)',
 }
 
 
 def record_mismatch(fixture, supplied, text, transform):
-    """Why a submission does not belong to the target record, or None if it does."""
+    """(why the submission does not belong to the target, the record its text belongs to), or (None, target)."""
     target = fixture['target']
     records = [json.loads(line) for line in fixture['contents'].splitlines()]
     others = [r for r in records if r['id'] != target['id']]
     if not isinstance(supplied, dict):
-        return None
-    if any(supplied.get('id') == r['id'] for r in others):
-        return 'distractor'
+        return None, target
+    chosen = next((r for r in others if supplied.get('id') == r['id']), None)
+    if chosen:
+        return 'distractor', chosen
     if supplied.get('id') != target['id']:
-        return 'unknown_id'
+        return 'unknown_id', target
 
     def overlap(record):
         wanted = Counter(transform(record['payload'], fixture['transformation']).split())
         received = Counter(text.split())
         return sum((wanted & received).values()) / max(sum(wanted.values()), sum(received.values()), 1)
-    if others and max(map(overlap, others)) > overlap(target):
-        return 'distractor_text'
+    best = max(others, key=overlap, default=None)
+    if best and overlap(best) > overlap(target):
+        return 'distractor_text', best
     if supplied.get('revision') != target['revision']:
-        return 'revision'
-    return None
+        return 'revision', target
+    return None, target
+
+
+# Lookup and transformation are equal halves of a task: a record error keeps half the transformation credit.
+RECORD_ERROR_CREDIT = .5
+
+
+def submission_credit(fixture, name, supplied):
+    """(match credit, transformation score) for a submit_result call.
+
+    The transformation score is the similarity to the correct transformation of the record the text belongs to.
+    The credit is that score, times RECORD_ERROR_CREDIT if the record is not the target. A malformed call or a
+    copied payload gets (0, None)."""
+    if (name != 'submit_result' or not isinstance(supplied, dict) or set(supplied) != {'id', 'revision', 'text'}
+            or type(supplied['revision']) is not int or not isinstance(supplied['text'], str)):
+        return 0.0, None
+    text = supplied['text']
+    kind, record = record_mismatch(fixture, supplied, text, transform)
+    if text.split() == record['payload'].split():
+        return 0.0, None
+    similarity = text_quality(transform(record['payload'], fixture['transformation']), text)['similarity']
+    return similarity * (1 if kind is None else RECORD_ERROR_CREDIT), similarity
 
 
 def session_diagnostics(raw, transform):
@@ -1691,7 +1726,7 @@ def session_diagnostics(raw, transform):
                             findings['loop'].append((ref, loop))
                 if not isinstance(text, str) or text == expected:
                     continue
-                record = record_mismatch(fixture, supplied, text, transform)
+                record, _ = record_mismatch(fixture, supplied, text, transform)
                 if record:
                     # The text belongs to another record, so word overlap with the target says nothing.
                     findings['record'].append((f"{ref} ({context_label(prompt)})", record))
@@ -1741,7 +1776,7 @@ def session_diagnostics(raw, transform):
     if len(block_counts) >= 3 and len(set(block_counts)) >= 2:
         granularity = math.gcd(*block_counts)
         if 128 <= granularity <= 65536 and granularity & (granularity - 1) == 0:
-            notes.append({'lanes': sorted(block_lanes), 'columns': ['mix'], 'text': f'Cache hits align to {granularity:,}-token units (inferred). Partial-block tails may be re-prefilled; usage totals cannot distinguish those tails from new input or prove the internal block size.'})
+            notes.append({'lanes': sorted(block_lanes), 'columns': ['mix'], 'text': f'Cache hits align to {granularity:,}-token units (inferred). Partial-block tails may be re-prefilled.'})
     return notes
 
 
@@ -2375,7 +2410,7 @@ def run_session(client, config, tasks, session, state=None):
             if control:
                 control.check()
             task_ok, aborted = True, False
-            dependency_ok, quality_credit, edit = True, 0.0, None
+            dependency_ok, quality_credit, transform_score, edit = True, 0.0, None, None
             resize_task(task, config, config.words)
             target = task["target"]
             words = task["words"]
@@ -2416,7 +2451,7 @@ def run_session(client, config, tasks, session, state=None):
                         control.check()
                     budget.check(messages, stage)
                     if stage == "submit_result":
-                        quality_credit, edit = 0.0, None
+                        quality_credit, transform_score, edit = 0.0, None, None
                     if ui:
                         ui.lane(session, task=index + 1, stage=stage, attempt=attempt + 1, status="waiting")
                     entry = {"task": index + 1, "stage": stage, "attempt": attempt + 1,
@@ -2489,11 +2524,7 @@ def run_session(client, config, tasks, session, state=None):
                                 issue["character_edit_distance"] = edit["distance"]
                                 issue["text_similarity"] = edit["similarity"]
                                 issue["message"] += f"; character edit distance {edit['distance']} ({edit['similarity']:.1%} text match)"
-                            metadata_ok = (function["name"] == stage and set(supplied) == set(arguments)
-                                           and supplied.get("id") == target["id"]
-                                           and type(supplied.get("revision")) is int
-                                           and supplied["revision"] == target["revision"])
-                            quality_credit = edit["similarity"] if metadata_ok and not edit["copied_payload"] else 0.0
+                            quality_credit, transform_score = submission_credit(task, function["name"], supplied)
                     except RunCancelled as exc:
                         trace.emit(sid, phase, "request_error", task=index + 1, request_id=request_id,
                                    error={"type": type(exc).__name__, "message": str(exc), "kind": control.kind if control else None})
@@ -2578,6 +2609,7 @@ def run_session(client, config, tasks, session, state=None):
             task_results.append({"task": index + 1, "transformation": transformation, "source_words": words,
                                  "load_words": sum(r.get("generated_words", 0) for r in requests[task_request_start:]), "correct": task_ok, "load_completed": not aborted,
                                  "quality_credit": quality_credit if dependency_ok and not aborted else 0.0,
+                                 "transform_score": transform_score if dependency_ok and not aborted else None,
                                  "read_padding_words": padding_words, "history_compacted_before": compact_before,
                                  "text_quality": edit, "finished_seconds": time.perf_counter() - started})
             if gate:
@@ -3391,9 +3423,7 @@ def session_from_events(events, lane, cache_policy):
                     quality['received_words'] = len(supplied['text'].split())
                     quality['copied_payload'] = supplied['text'].split() == target['payload'].split()
                     entry['text_quality'] = quality
-                    metadata_ok = function['name'] == stage and set(supplied) == set(wanted) and supplied.get('id') == target['id'] and type(
-                        supplied.get('revision')) is int and supplied['revision'] == target['revision']
-                    entry['quality_credit'] = quality['similarity'] if metadata_ok and not quality['copied_payload'] else 0
+                    entry['quality_credit'], entry['transform_score'] = submission_credit(fixture, function['name'], supplied)
         except RunCancelled:
             pass
         except Exception as exc:
@@ -3412,6 +3442,7 @@ def session_from_events(events, lane, cache_policy):
                         'transformation': plan['fixture']['transformation'], 'correct': correct,
                         'load_completed': completed, 'load_words': load_words,
                         'quality_credit': submit.get('quality_credit', 0) if dependencies and completed else 0,
+                        'transform_score': submit.get('transform_score') if dependencies and completed else None,
                         'text_quality': submit.get('text_quality'), 'read_padding_words': len(plan['padding'].split()),
                         'history_compacted_before': any(e['type'] == 'history_reset' and e.get('task') == task for e in events),
                         'finished_seconds': ending['elapsed'] - start['elapsed']})
