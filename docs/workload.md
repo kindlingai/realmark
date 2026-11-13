@@ -1,4 +1,4 @@
-# Word-based workload (protocol v13)
+# Word-based workload (protocol v15)
 
 The default load targets **2 weighted words of newly supplied input per expected
 visible output word**. Words/identifiers count as 1; non-whitespace punctuation
@@ -59,3 +59,25 @@ because the lanes' contexts exceed its cache.
 at `--sim-prefill-half-context` and `--sim-decode-half-context` tokens (131,072 each by
 default; 0 turns the effect off). `--sim-kv-tokens` caps the prefix cache shared by all
 lanes and evicts the least recently used lanes; 0 (the default) is unlimited.
+
+## Sampling (v14)
+
+The server's default temperature applies unless `--temperature` sets one. `--extra-body` merges
+any other request fields. Earlier protocols sent temperature 0 in every request without recording
+it. The card shows the temperature each run used. v14 tasks are
+identical to v13's, so `--resume` continues a v13 run, at temperature 0 to match its saved levels.
+
+## Tool choice, rules and thinking (v15)
+
+`--forced-tool-choice false` lets the model choose each tool. Each `read_file` result then carries a
+`submit_key`, and `submit_result` must include it, so a task cannot be submitted unread. The harness answers
+whichever tool the model calls, closes the task on its first keyed submit, and replies that the task is final
+and will not be graded or reopened. A task with no keyed submit after 8 calls earns nothing.
+
+The system prompt lists every transformation's rules, and `read_file` names the task's transformation only.
+The rules sit in the cached prefix from the first request, so a model can settle its method during warmup.
+`--no-think-prompt` (on by default) asks the model not to think before tool calls.
+
+The score charges thinking time at half weight: per request, the time from the first reasoning output to
+the first visible output, summed over lanes and divided by C. The card's Think column shows thinking as a
+share of elapsed time.

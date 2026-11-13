@@ -33,7 +33,7 @@ counts of real agentic work streams.
 The score is defined as:
 
 $$
-S_C = 1000 \cdot \frac{\sinh^{-1}\left(\dfrac{W_C}{10\,T_C}\right)}{\sinh^{-1}(1)}
+S_C = 1000 \cdot \frac{\sinh^{-1}\left(\dfrac{W_C}{10\,(T_C - \frac{1}{2}\Theta_C)}\right)}{\sinh^{-1}(1)}
 $$
 
 where
@@ -41,6 +41,9 @@ where
 - $W_C$ is the weighted visible output words all lanes' finished tasks (each punctuation mark or symbol counts as $0.25$),
   across reply text and tool-call arguments. Thinking is excluded.
 - $T_C$ is the wall-clock time in seconds, from the start of non-warmup work until the last lane finishes.
+- $\Theta_C$ is the wall-clock time spent thinking: for each request, the seconds from its first reasoning output to
+  its first visible output, summed over all lanes and divided by $C$. Thinking time counts at half weight, so a
+  model that thinks longer still scores lower, but not one for one.
 
 By default, RIPAL measures four levels of concurrency (C=1, 2 and 4), but this can be overridden on
 the command-line.

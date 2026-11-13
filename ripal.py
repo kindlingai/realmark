@@ -883,7 +883,7 @@ CHART_TITLE = re.compile(r"[A-Za-z](?:(?!\s{3})[^·│\u2800-\u28ff])*?  ·  Y: 
 # Inside a chart row: a title, a Y tick (a number before its axis), an X label (C=4, 16K), or axis lines.
 CHART_TOKEN = re.compile(r"(?P<title>" + CHART_TITLE.pattern + r")|(?P<tick>\d[\d,.]*(?= [│└]))"
                          r"|(?P<label>\bC=\d+\b|\b\d+(?:\.\d+)?K\b)|(?P<axis>[│└─]+)")
-CARD_COLUMNS = ("C", "Score", "Decode (t/s)", "Prefill (t/s)", "Context (t)", "Completed", "Time (s)",
+CARD_COLUMNS = ("C", "Score", "Decode (t/s)", "Prefill (t/s)", "Context (t)", "Done", "Time (s)", "Think",
                 "Match (%)", "Mix (w / t)")
 
 
@@ -1064,14 +1064,25 @@ def match_label(quality):
 
 def result_card(report, width=98):
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
-    notes = report.get("diagnostics", [])
+    stopped = report.get("stopped_profiles", {})
+    notes = report.get("diagnostics", []) + [
+        {"lanes": [int(lanes)], "columns": ["context"],
+         "text": f"C={lanes} stopped during {info['phase']} at about {context_label(info['context_tokens'])} total context "
+                 f"({context_label(info['context_tokens_per_lane'])} per stream): {report.get('termination_reason') or 'run stopped'}"
+                 + (f". Prefix cache hits: {info['cache_hit_share']:.0%} of prompt tokens"
+                    if info.get('cache_hit_share') is not None else "")}
+        for lanes, info in sorted(stopped.items(), key=lambda item: int(item[0]))] + [
+        {"lanes": [int(lanes)], "columns": ["context"],
+         "text": f"C={lanes} history cut to {cut['words']:,} words ({context_label(cut['tokens'])} opening context) to fit "
+                 f"--max-server-context; this row is a lighter workload than the others"}
+        for lanes, cut in sorted(report.get("history_cuts", {}).items(), key=lambda item: int(item[0]))]
     superscripts = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
     def markers(lanes, column):
         return "".join(str(index).translate(superscripts) for index, note in enumerate(notes, 1)
                        if int(lanes) in note["lanes"] and column in note["columns"])
     rows = []
     for lanes, summary in summaries:
-        mark = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time")}
+        mark = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time", "context")}
         ratio = summary["token_mix"].get("fresh_per_output")
         words = summary.get("word_mix", {}).get("input_per_output")
         prefix = "~" if summary.get("mix_excludes_cancelled_filler_usage", False) else ""
@@ -1082,11 +1093,20 @@ def result_card(report, width=98):
             str(lanes), compact_number(summary["score"], 9),
             card_rate(summary, lanes, "decode_tokens_per_second", 14) + mark["decode"],
             card_rate(summary, lanes, "prefill_tokens_per_second", 15) + mark["prefill"],
-            context_cell(summary),
+            context_cell(summary) + mark["context"],
             f"{summary.get('load_completed_tasks', planned)}/{planned}",
             ("~" if estimated else "") + compact_number(seconds, 9, 2) + mark["time"],
+            f"{summary['think_share']:.0%}" if summary.get("think_share") is not None else "—",
             match_label(summary.get("edit_quality")) + mark["match"],
             f"{prefix}{compact_number(words, 3)}w/{compact_number(ratio, 3)}t" + mark["mix"]])
+    for lanes, info in sorted(stopped.items(), key=lambda item: int(item[0])):
+        if lanes in dict(summaries):
+            continue
+        context = (f"~{context_label(info['context_tokens'])} (~{context_label(info['context_tokens_per_lane'])})"
+                   if info["context_tokens"] else "—")
+        rows.append([lanes, "—", "—", "—", context + markers(lanes, "context"),
+                     f"{info['completed_tasks']}/{info['planned_tasks']}", "—", "—", "—", "—"])
+    rows.sort(key=lambda row: int(row[0]))
     sizes = [max(len(cell) for cell in column) for column in zip(CARD_COLUMNS, *rows)]
     width = max(sum(sizes) + 2 * (len(sizes) - 1) + 4, width)
     body = []
@@ -1094,12 +1114,25 @@ def result_card(report, width=98):
         body.append(safe_text(text)[:width - 4])
     heading = ("RealMark Partial Results — SERVER OVERWHELMED" if report.get("termination_kind") == "overload" else
                "RealMark Partial Results — INTERRUPTED" if report.get("interrupted") else "RealMark Results")
-    add(f"{heading}  ·  {report['model']}")
+    temperature = report.get("sampling", {}).get("temperature")
+    forced = report.get("sampling", {}).get("forced_tool_choice", True)
+    add(f"{heading}  ·  {report['model']}  ·  temperature "
+        + (f"{temperature:g}" if isinstance(temperature, (int, float)) else "server default")
+        + ("" if forced else "  ·  tool choice auto"))
     qualities = [s["edit_quality"] for _, s in summaries if s.get("edit_quality") is not None]
     overall = report.get("geometric_mean_score")
+    measured = [s["score"] for _, s in summaries if s.get("score")]
+    if overall is None and measured:
+        overall = math.exp(statistics.mean(map(math.log, measured)))
+    # A headline over incomplete levels says which ones.
+    caveats = ([f"C={lanes} history cut" for lanes in report.get("history_cuts", {})]
+               + [f"C={lanes} capped" for lanes, s in summaries if s.get("context_limited_sessions")]
+               + [f"C={lanes} stopped" for lanes in stopped]
+               + [f"C={lanes} not run" for lanes in report.get("skipped_levels", {})])
+    partial = f"  ({', '.join(sorted(caveats, key=lambda c: int(c[2:].split()[0])))})" if caveats else ""
     if overall is not None:
         letter = grade(statistics.mean(qualities)) if qualities else None
-        add(f"RIPAL Score: {overall:,.1f}" + (f"  {letter}" if letter else ""))
+        add(f"RIPAL Score: {overall:,.1f}" + (f"  {letter}" if letter else "") + partial)
     if report.get("terminated") or report.get("interrupted"):
         if report.get("termination_reason"):
             add("Stopped: " + report["termination_reason"])
@@ -1117,10 +1150,15 @@ def result_card(report, width=98):
         add(f"Load tasks across all phases: {complete} completed · {unfinished} unfinished")
         add(f"Observed tokens across all phases: fresh {fresh:,} · decode {output:,}")
         add("Partial batch scores are provisional; unfinished work gets no credit.")
-        if report.get("unmeasured_lanes"):
-            add("Not measured: " + ", ".join(f"{n}L" for n in report["unmeasured_lanes"]))
+        unmeasured = [n for n in report.get("unmeasured_lanes", [])
+                      if str(n) not in stopped and str(n) not in report.get("skipped_levels", {})]
+        if unmeasured:
+            add("Not measured: " + ", ".join(f"C={n}" for n in unmeasured))
     if report.get("context_error"):
         add("Context setup: " + report["context_error"])
+    for lanes, reason in sorted(report.get("skipped_levels", {}).items(), key=lambda item: int(item[0])):
+        for line in textwrap.wrap(f"C={lanes} not run: {reason}.", width=width - 4, subsequent_indent="  "):
+            add(line)
     add()
     for row in [list(CARD_COLUMNS)] + rows:
         add("  ".join(cell.rjust(size) for cell, size in zip(row, sizes)))
@@ -1316,7 +1354,7 @@ class ContextBudget:
         for stage, arguments, result in [
             ("search_records", {"id": task["target"]["id"]}, {"path": task["path"]}),
             ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": padding,
-                          "transformation": task["transformation"], "instructions": task["instructions"]}),
+                          "transformation": task["transformation"], **read_instructions(task["transformation"])}),
         ]:
             call_id = "budget-" + "x" * 100
             preview.append({"role": "assistant", "content": None, "tool_calls": [{
@@ -1506,7 +1544,7 @@ class Telemetry:
 
 def export_report(args, report, protocol, scoring_reference):
     """Persist raw input/output and scheduling parameters, never computed scores."""
-    parameters = json.loads(json.dumps(vars(args), default=str))
+    parameters = json.loads(json.dumps({k: v for k, v in vars(args).items() if not k.startswith("_")}, default=str))
     raw = {'schema': SCHEMA, 'config': {
         'benchmark_version': report['version'], 'model': report['model'], 'base_url': report['base_url'],
         'parameters': parameters, 'workload': report.get('config', {}),
@@ -1517,6 +1555,10 @@ def export_report(args, report, protocol, scoring_reference):
                               'kind': report.get('termination_kind'), 'reason': report.get('termination_reason')})
     if report.get('context_error'):
         raw['events'].append({'type': 'setup_error', 'time': time.time(), 'message': report['context_error']})
+    for lanes, reason in report.get('skipped_levels', {}).items():
+        raw['events'].append({'type': 'level_skipped', 'time': time.time(), 'lanes': lanes, 'reason': reason})
+    for lanes, cut in report.get('history_cuts', {}).items():
+        raw['events'].append({'type': 'history_cut', 'time': time.time(), 'lanes': lanes, **cut})
 
     def stage_for(c):
         return raw['runs'].setdefault(f'c={c}', {'time': None, 'stages': [],
@@ -1975,6 +2017,10 @@ class VirtualModel:
                 result = json.loads(message['content'])
                 if result.get('next_task_id'):
                     target = result['next_task_id']
+        if stage == 'auto':
+            # A perfect agent: the next tool follows from the last tool result.
+            last = next((json.loads(m['content']) for m in reversed(messages) if m['role'] == 'tool'), {})
+            stage = ('submit_result' if 'submit_key' in last else 'read_file' if 'path' in last else 'search_records')
         if stage == 'search_records':
             args = {'id': target}
         elif stage == 'read_file':
@@ -1986,6 +2032,8 @@ class VirtualModel:
                          if m['role'] == 'tool' and 'contents' in json.loads(m['content']))
             record = next(json.loads(line) for line in found['contents'].splitlines() if json.loads(line)['id'] == target)
             args = {'id': target, 'revision': record['revision'], 'text': self.transform(record['payload'], found['transformation'])}
+            if 'submit_key' in found:
+                args['key'] = found['submit_key']
         arguments = json.dumps(args, ensure_ascii=False)
         prompt = self.count_prompt_tokens(messages)
         key = messages[1]['content']
@@ -2010,7 +2058,11 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v13"
+VERSION = "ripal-v15"
+# Seeds task generation. v14 changed only sampling, so its tasks are v13's.
+WORKLOAD_VERSION = "ripal-v13"
+# Protocols that sent temperature 0 in every request without recording it.
+OLD_TEMPERATURE_ZERO = {"ripal-v11", "ripal-v12", "ripal-v13"}
 TARGET_RATIO = 2.0
 WORDS = """amber birch cedar delta ember fern garden harbor island jungle kettle lantern
 maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr
@@ -2062,6 +2114,18 @@ Ignore read_padding; it is irrelevant filler.
 These are mechanical text conversions. Use tool calls only; do not explain or plan.
 Continue with next_task_id even when ok is false; harness_continuation data
 is supplied to keep the workload moving after validation errors."""
+NO_THINK_PROMPT = "Do not think or reason before a tool call. Call the next tool immediately."
+# v15 lists every transformation's rules in the system prompt, so they sit in the cached prefix from the first
+# request and a model can settle its method during warmup. read_file then names the transformation only.
+RULES_SENTENCE = "The read_file result specifies the transformation and instructions for that task."
+RULES_PROMPT = ("The read_file result names the task's transformation. Its rules:\n"
+                + "\n".join(f"- {name}: {text}" for name, text in TRANSFORMATIONS.items()))
+RULES_IN_SYSTEM = True
+
+
+def read_instructions(transformation):
+    """The instructions field of a read_file result: empty when the system prompt holds the rules."""
+    return {} if RULES_IN_SYSTEM else {"instructions": TRANSFORMATIONS[transformation]}
 
 
 def tool(name, description, properties):
@@ -2080,6 +2144,63 @@ TOOLS = [
          {"id": {"type": "string"}, "revision": {"type": "integer"},
           "text": {"type": "string"}}),
 ]
+
+
+# Auto mode: submit_result also takes the key read_file returns, so a task cannot be submitted unread.
+AUTO_TOOLS = TOOLS[:2] + [
+    tool("submit_result", "Submit the transformed payload of the target record, with its file's submit_key.",
+         {"id": {"type": "string"}, "revision": {"type": "integer"}, "text": {"type": "string"},
+          "key": {"type": "string"}}),
+]
+# Auto mode: calls a task may take before it is abandoned.
+AUTO_CALLS_PER_TASK = 8
+
+
+def auto_call(fixture, message):
+    """The harness's answer to one auto-mode reply, computed from the task fixture alone so a replay agrees.
+
+    Returns name (the tool called), reply (the tool result to send), issue (None for a useful call),
+    submitted, credit and transform (the match credit and transformation score of an accepted submit)."""
+    target = fixture["target"]
+    outcome = {"name": None, "issue": None, "submitted": False, "credit": 0.0, "transform": None}
+
+    def fail(text):
+        outcome.update(issue={"kind": "auto_call", "message": text}, reply={"error": text})
+        return outcome
+    calls = message.get("tool_calls") or []
+    if len(calls) != 1:
+        return fail(f"Call exactly one tool. The current task is {target['id']}.")
+    function = calls[0].get("function") or {}
+    name = outcome["name"] = function.get("name")
+    try:
+        supplied = json.loads(function.get("arguments") or "")
+    except (ValueError, TypeError):
+        supplied = None
+    if not isinstance(supplied, dict):
+        return fail("Tool arguments must be a JSON object.")
+    if name == "search_records":
+        if supplied.get("id") != target["id"]:
+            return fail(f"No open task has record {supplied.get('id')!r}. The current task is {target['id']}.")
+        outcome["reply"] = {"path": fixture["path"]}
+    elif name == "read_file":
+        if supplied.get("path") != fixture["path"]:
+            return fail(f"{supplied.get('path')!r} is not the current task's file. Search for {target['id']} to find it.")
+        outcome["reply"] = {"contents": fixture["contents"], "read_padding": fixture["read_padding"],
+                            "transformation": fixture["transformation"], **read_instructions(fixture["transformation"]),
+                            "submit_key": fixture["submit_key"]}
+    elif name == "submit_result":
+        if supplied.get("key") != fixture["submit_key"]:
+            return fail(f"That key does not open the current task, {target['id']}. Read its file for its submit_key.")
+        # An accepted submit closes the task without a grade, as a real tool would. Saying so plainly stops
+        # models from spending their next turn auditing a task they cannot change.
+        outcome.update(submitted=True, reply={
+            "accepted": True, "final": True, "next_task_id": fixture.get("next_id"),
+            "message": "Task closed. It is not graded here and cannot be resubmitted. Continue with next_task_id."})
+        outcome["credit"], outcome["transform"] = submission_credit(
+            fixture, name, {k: v for k, v in supplied.items() if k != "key"})
+    else:
+        return fail(f"Unknown tool {name!r}.")
+    return outcome
 
 
 @dataclass(frozen=True)
@@ -2147,7 +2268,7 @@ def make_session(config, session, task_offset=0):
     tasks = []
     for task_index in range(config.tasks):
         transformation = TRANSFORMATION_CYCLE[(task_offset + task_index) % len(TRANSFORMATION_CYCLE)]
-        task = {"record_seed": f"{VERSION}:{config.seed}:{session}:{task_index}:records",
+        task = {"record_seed": f"{WORKLOAD_VERSION}:{config.seed}:{session}:{task_index}:records",
                 "path": f"/workspace/session-{session}/file-{task_index}.jsonl",
                 "transformation": transformation, "instructions": TRANSFORMATIONS[transformation],
                 "padding_seed": f"{config.seed}:{session}:{task_index}:padding",
@@ -2168,7 +2289,7 @@ def history_messages(config, session):
     planner = WordMixPlanner(0, TARGET_RATIO)
     while total < config.history_words:
         transformation = TRANSFORMATION_CYCLE[index % len(TRANSFORMATION_CYCLE)]
-        task = resize_task({"record_seed": f"{VERSION}:{config.seed}:{session}:history:{index}:records",
+        task = resize_task({"record_seed": f"{WORKLOAD_VERSION}:{config.seed}:{session}:history:{index}:records",
                             "transformation": transformation}, config, config.words)
         target = task["target"]
         path = f"/workspace/session-{session}/history-{index}.jsonl"
@@ -2176,7 +2297,7 @@ def history_messages(config, session):
             ("search_records", {"id": target["id"]}, {"path": path}),
             ("read_file", {"path": path}, {"contents": task["contents"], "read_padding": "",
                                            "transformation": transformation,
-                                           "instructions": TRANSFORMATIONS[transformation]}),
+                                           **read_instructions(transformation)}),
             ("submit_result", {"id": target["id"], "revision": target["revision"],
                                "text": transform(target["payload"], transformation)}, {"ok": True}),
         ]
@@ -2305,6 +2426,7 @@ class Client:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.timeout = model, api_key, timeout
         self.extra = extra or {}
+        self.forced_tool_choice = True
         self.cache_policy = cache_policy
         self.streaming = streaming
         protected = {"model", "messages", "tools", "tool_choice", "stream", "n"}
@@ -2341,9 +2463,10 @@ class Client:
         return count if count is not None else len(result["tokens"])
 
     def complete(self, messages, stage, config, cancel_control=None, on_chunk=None):
-        body = {"temperature": 0, "max_tokens": config.max_tokens, **self.extra,
+        body = {"max_tokens": config.max_tokens, **self.extra,
                 "model": self.model, "messages": messages, "tools": TOOLS,
-                "tool_choice": {"type": "function", "function": {"name": stage}},
+                # Forcing names the expected tool. Auto leaves the choice, and any thinking, to the model.
+                "tool_choice": {"type": "function", "function": {"name": stage}} if self.forced_tool_choice else "auto",
                 "parallel_tool_calls": False, "stream": self.streaming}
         if self.streaming:
             body["stream_options"] = {"include_usage": True}
@@ -2400,6 +2523,7 @@ def run_session(client, config, tasks, session, state=None):
     budget = state.get("budget") or ContextBudget(client, TOOLS, output_reserve)
     budget.client = client
     gate = getattr(client, "task_gate", None)
+    auto = not getattr(client, "forced_tool_choice", True)
     compact_before = False
     try:
         if state.get("context_reason"):
@@ -2425,10 +2549,15 @@ def run_session(client, config, tasks, session, state=None):
             expected = [
                 ("search_records", {"id": target["id"]}, {"path": task["path"]}),
                 ("read_file", {"path": task["path"]}, {"contents": task["contents"], "read_padding": "",
-                 "transformation": transformation, "instructions": task["instructions"]}),
+                 "transformation": transformation, **read_instructions(transformation)}),
                 ("submit_result", {"id": target["id"], "revision": target["revision"], "text": expected_text},
                  {"ok": True, "next_task_id": next_id}),
             ]
+            task["submit_key"] = hashlib.sha256(task["record_seed"].encode()).hexdigest()[:16]
+            task["next_id"] = next_id
+            if auto:
+                expected[1][2]["submit_key"] = task["submit_key"]
+                expected[2][1]["key"] = task["submit_key"]
             if compact_before:
                 mix_control.input_words += sum(weighted_words(m.get("content")) for m in (messages[0], messages[-1]))
             padding_words = mix_control.plan(expected, index + 1)
@@ -2445,11 +2574,15 @@ def run_session(client, config, tasks, session, state=None):
             if ui:
                 ui.lane(session, padding=padding_words, words=words, planned_input=mix_control.input_words,
                         planned_output=mix_control.output_words)
-            for stage, arguments, result in expected:
-                for attempt in range(config.retries + 1):
+            submitted = False
+            # Auto mode answers whatever tool each reply calls, until a keyed submit or the call budget.
+            steps = [("auto", None, None)] * AUTO_CALLS_PER_TASK if auto else expected
+            for stage, arguments, result in steps:
+                for attempt in range(1 if auto else config.retries + 1):
                     if control:
                         control.check()
-                    budget.check(messages, stage)
+                    auto_reply = None
+                    estimated_prompt = budget.check(messages, stage)
                     if stage == "submit_result":
                         quality_credit, transform_score, edit = 0.0, None, None
                     if ui:
@@ -2459,7 +2592,7 @@ def run_session(client, config, tasks, session, state=None):
                              "tokens": {"available": False, "requests": 1}, "valid": False}
                     requests.append(entry)
                     request_started = time.perf_counter()
-                    deadline = response_deadline(client, words, stage)
+                    deadline = response_deadline(client, words, "submit_result" if auto else stage)
                     if history_prefill and deadline is not None:
                         # The lane's first request prefills the whole history.
                         deadline += state.get("history_deadline_seconds", 0)
@@ -2468,7 +2601,8 @@ def run_session(client, config, tasks, session, state=None):
                     request_id = f"{sid}:request:{calls}"
                     trace.emit(sid, phase, "request", task=index + 1, request_id=request_id,
                                stage=stage, attempt=attempt + 1, context_messages=len(messages),
-                               params={"temperature": 0, "max_tokens": task_config.max_tokens, **getattr(client, "extra", {}),
+                               estimated_prompt_tokens=estimated_prompt,
+                               params={"max_tokens": task_config.max_tokens, **getattr(client, "extra", {}),
                                        "stream": getattr(client, "streaming", True), "deadline_seconds": deadline})
                     def chunk_event(payload, at, request_id=request_id, task_number=index + 1):
                         trace.emit(sid, phase, "stream_chunk", at=at, task=task_number,
@@ -2503,28 +2637,37 @@ def run_session(client, config, tasks, session, state=None):
                             call = tool_calls[0]
                         if choice.get("finish_reason") == "length":
                             raise ValueError("generation reached max_tokens")
-                        if message.get("content") and str(message["content"]).strip():
-                            entry["response_excerpt"] = str(message["content"])[:240]
-                            raise ValueError("expected tool calls only, without explanatory text")
-                        if call is None:
-                            raise ValueError("expected exactly one tool call")
-                        function = call["function"]
-                        try:
-                            supplied = json.loads(function["arguments"])
-                        except (ValueError, TypeError):
-                            supplied = None
-                            entry["arguments_excerpt"] = str(function.get("arguments"))[:240]
-                        issue = validation_issue(stage, function["name"], arguments, supplied)
-                        if stage == "submit_result" and isinstance(supplied, dict) and isinstance(supplied.get("text"), str):
-                            edit = text_quality(arguments["text"], supplied["text"])
-                            edit["received_words"] = len(supplied["text"].split())
-                            edit["copied_payload"] = supplied["text"].split() == target["payload"].split()
-                            entry["text_quality"] = edit
-                            if issue:
-                                issue["character_edit_distance"] = edit["distance"]
-                                issue["text_similarity"] = edit["similarity"]
-                                issue["message"] += f"; character edit distance {edit['distance']} ({edit['similarity']:.1%} text match)"
-                            quality_credit, transform_score = submission_credit(task, function["name"], supplied)
+                        if auto:
+                            outcome = auto_call({**task, "read_padding": padding}, message)
+                            issue, auto_reply, entry["called"] = outcome["issue"], outcome["reply"], outcome["name"]
+                            if outcome["submitted"]:
+                                submitted = entry["submitted"] = True
+                                quality_credit, transform_score = outcome["credit"], outcome["transform"]
+                        else:
+                            if choice.get("finish_reason") == "length":
+                                raise ValueError("generation reached max_tokens")
+                            if message.get("content") and str(message["content"]).strip():
+                                entry["response_excerpt"] = str(message["content"])[:240]
+                                raise ValueError("expected tool calls only, without explanatory text")
+                            if call is None:
+                                raise ValueError("expected exactly one tool call")
+                            function = call["function"]
+                            try:
+                                supplied = json.loads(function["arguments"])
+                            except (ValueError, TypeError):
+                                supplied = None
+                                entry["arguments_excerpt"] = str(function.get("arguments"))[:240]
+                            issue = validation_issue(stage, function["name"], arguments, supplied)
+                            if stage == "submit_result" and isinstance(supplied, dict) and isinstance(supplied.get("text"), str):
+                                edit = text_quality(arguments["text"], supplied["text"])
+                                edit["received_words"] = len(supplied["text"].split())
+                                edit["copied_payload"] = supplied["text"].split() == target["payload"].split()
+                                entry["text_quality"] = edit
+                                if issue:
+                                    issue["character_edit_distance"] = edit["distance"]
+                                    issue["text_similarity"] = edit["similarity"]
+                                    issue["message"] += f"; character edit distance {edit['distance']} ({edit['similarity']:.1%} text match)"
+                                quality_credit, transform_score = submission_credit(task, function["name"], supplied)
                     except RunCancelled as exc:
                         trace.emit(sid, phase, "request_error", task=index + 1, request_id=request_id,
                                    error={"type": type(exc).__name__, "message": str(exc), "kind": control.kind if control else None})
@@ -2566,7 +2709,9 @@ def run_session(client, config, tasks, session, state=None):
                                 ui.difference(issue["expected_excerpt"], issue["received_excerpt"])
                             else:
                                 emit(client, f"  expected: {issue['expected_excerpt']!r} | received: {issue['received_excerpt']!r}")
-                    if issue is None:
+                    if auto:
+                        reply = auto_reply or {"error": issue["message"]}
+                    elif issue is None:
                         reply = result
                     elif exhausted and not config.strict and received:
                         # Supply only the intended tool fixture / next ID, never a transformed answer.
@@ -2590,6 +2735,9 @@ def run_session(client, config, tasks, session, state=None):
                         # Do not replay a malformed assistant envelope into the next API request.
                         messages.append({"role": "user", "content": "Harness feedback: " + json.dumps(reply)})
                     trace.emit(sid, phase, "messages", task=index + 1, request_id=request_id, messages=messages[replay_start:])
+                    if auto:
+                        aborted = not received
+                        break
                     if issue is None:
                         break
                     if exhausted:
@@ -2602,8 +2750,11 @@ def run_session(client, config, tasks, session, state=None):
                             aborted = True
                         break
                     retries += 1
-                if aborted:
+                if aborted or submitted:
                     break
+            if auto:
+                task_ok = submitted and quality_credit == 1
+                aborted = aborted or not submitted
             completed += int(task_ok)
             exercised += int(not aborted)
             task_results.append({"task": index + 1, "transformation": transformation, "source_words": words,
@@ -2840,7 +2991,9 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             "time_limited": time_limited, "stage_budget": time_budget,
             "estimated_full_seconds": projected_seconds, "score_work_unit_words": SCORE_WORDS,
             **termination_state(client), "interrupted": any(s["interrupted"] for s in sessions) or stop_requested(client),
-            "score": score(credit, elapsed) if not config.strict or valid else None,
+            "think_seconds": run_think_seconds(sessions, lanes),
+            "score": score(credit, scored_seconds(elapsed, run_think_seconds(sessions, lanes)))
+                if not config.strict or valid else None,
             "effective_sessions": credit, "sessions": sessions, "completed_words": completed_words, "estimated_planned_words": forecast_words, "token_mix": observed_mix,
             "primary_token_mix": primary_mix, "filler_sessions": filler_sessions,
             "word_mix": combine_word_mix(s["word_mix"] for s in sessions + filler_sessions),
@@ -2850,6 +3003,41 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             "filler_cancelled_requests": sum(s["cancelled_requests"] for s in filler_sessions),
             "filler_response_failures": sum(s["response_failures"] for s in filler_sessions),
             "mix_excludes_cancelled_filler_usage": any(s["cancelled_requests"] for s in filler_sessions)}
+
+
+# Thinking time counts at this fraction in the score: it still costs, but not one for one.
+THINK_TIME_WEIGHT = .5
+
+
+def think_seconds(events):
+    """Seconds of streamed thinking: per request, first reasoning delta to first visible delta (tool call or text)."""
+    chunks = {}
+    for event in events:
+        if event['type'] == 'stream_chunk' and event['data'] != '[DONE]':
+            chunks.setdefault(event['request_id'], []).append(event)
+    total = 0.0
+    for request in chunks.values():
+        started = visible = None
+        for chunk in sorted(request, key=lambda e: e['elapsed']):
+            for choice in json.loads(chunk['data']).get('choices', []):
+                delta = choice.get('delta') or {}
+                if started is None and (delta.get('reasoning_content') or delta.get('reasoning')):
+                    started = chunk['elapsed']
+                if visible is None and (delta.get('tool_calls') or (delta.get('content') or '').strip()):
+                    visible = chunk['elapsed']
+        if started is not None:
+            total += max(0.0, (visible if visible is not None else max(e['elapsed'] for e in request)) - started)
+    return total
+
+
+def run_think_seconds(sessions, lanes):
+    """Wall-clock thinking of a batch: all lanes' thinking seconds over the lane count."""
+    return sum(think_seconds([e for e in s.get('telemetry', []) if e['session'] == s['telemetry_session']])
+               for s in sessions) / lanes
+
+
+def scored_seconds(seconds, thinking):
+    return seconds - (1 - THINK_TIME_WEIGHT) * thinking
 
 
 def score(sessions, seconds):
@@ -2899,6 +3087,10 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
               target_ratio=None, ratio_tolerance=.15, allow_failures=False):
     times = [run["seconds"] for run in runs]
     mean = statistics.mean(times)
+    thinking = statistics.mean(run.get("think_seconds", 0) for run in runs)
+    # Scores charge thinking at THINK_TIME_WEIGHT; Time and the other timings stay elapsed seconds.
+    charged = [scored_seconds(run["seconds"], run.get("think_seconds", 0)) for run in runs]
+    charged_mean = statistics.mean(charged)
     stdev = statistics.stdev(times) if len(times) > 1 else None
     correct = warmup_valid and all(run["valid"] for run in runs)
     mix = token_mix(run.get("token_mix", {"available": False}) for run in runs)
@@ -2914,7 +3106,7 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
         # Resample whole batches: sessions sharing a server are correlated.
         points = []
         for _ in range(bootstrap_samples):
-            sample = rng.choices(list(zip(times, credits)), k=len(times))
+            sample = rng.choices(list(zip(charged, credits)), k=len(charged))
             points.append(score(sum(c for _, c in sample), sum(t for t, _ in sample)))
         interval = [percentile(points, .025), percentile(points, .975)]
     latencies = [s["seconds"] for run in runs for s in run["sessions"]]
@@ -2925,14 +3117,14 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
     failed = sum(s.get("failed_tasks", 0) for s in sessions)
     accuracy = passed / planned if planned else None
     context_skipped = sum(s.get("context_skipped_tasks", 0) for s in sessions)
-    quality_tasks = sum(len(s.get("task_results", [])) if s.get("time_limited") else
+    quality_tasks = sum(len(s.get("task_results", [])) if s.get("time_limited") or s.get("interrupted") else
                         s.get("planned_tasks", 0) - s.get("context_skipped_tasks", 0) for s in sessions)
     quality = sum(s.get("quality_credit", s.get("completed_tasks", 0)) for s in sessions) / quality_tasks if quality_tasks else None
     projected_completions = [extrapolate_seconds(s["seconds"], s.get("load_completed_words", 0),
                 projected_words(s))
                              if s.get("time_limited") else s["seconds"] for s in sessions]
     quality_credit = sum(s.get("quality_word_credit", s.get("quality_credit", s.get("completed_tasks", 0)) * 256) for s in sessions)
-    edit_score = score(quality_credit / len(runs) / SCORE_WORDS, mean) if scored and quality is not None else None
+    edit_score = score(quality_credit / len(runs) / SCORE_WORDS, charged_mean) if scored and quality is not None else None
     spread = task_adjusted_score_spread(sessions, lanes)
     return {"profile": f"RIPAL-{lanes}L", "valid": valid, "measured_runs": len(runs),
             "interrupted": interrupted, "time_limited": time_limited,
@@ -2977,11 +3169,13 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
             "mean_seconds": mean, "stdev_seconds": stdev,
             "timing_cv": stdev / mean if stdev is not None else None,
             "min_seconds": min(times), "max_seconds": max(times),
-            "score": score(mean_credit, mean) if scored else None,
+            "score": score(mean_credit, charged_mean) if scored else None,
+            "think_seconds": thinking, "think_share": thinking / mean if mean > 0 else None,
+            "scored_seconds": charged_mean,
             "accuracy_adjusted_score": edit_score,
             "edit_adjusted_score": edit_score,
             "score_ci95": interval,
-            "sessions_per_minute": 60 * mean_credit / mean if scored else None,
+            "sessions_per_minute": 60 * mean_credit / mean if scored and mean > 0 else None,
             "session_latency_seconds": {"median": statistics.median(latencies),
                                         "p90": percentile(latencies, .9), "max": max(latencies)},
             "note": "Approximate percentile bootstrap CI; no outliers removed. Single-run uncertainty is unavailable."}
@@ -2999,6 +3193,14 @@ def peak_context(runs):
             "peak_context_tokens_per_lane": statistics.mean(p for run in peaks for p in run)}
 
 
+def boolean(value):
+    if value.lower() in ("true", "1", "yes", "on"):
+        return True
+    if value.lower() in ("false", "0", "no", "off"):
+        return False
+    raise argparse.ArgumentTypeError("use true or false")
+
+
 def positive(value):
     number = int(value)
     if number < 1:
@@ -3013,6 +3215,9 @@ def main():
     source.add_argument("--simulate", action="store_true", help="Always-correct virtual model with a discrete-event clock")
     source.add_argument("--model")
     source.add_argument("--render", type=Path, help="Re-render a saved JSON datafile offline; leaves the datafile unchanged")
+    source.add_argument("--resume", type=Path,
+                        help="Rerun the levels a stopped run did not finish, with its saved settings, and merge them into "
+                             "its results (the original is kept as NAME.before-resume.json)")
     parser.add_argument("--card-output", type=Path, help="Save the re-rendered plain-text card (requires --render)")
     parser.add_argument("--sim-prefill", type=float, default=1000, help="Virtual model aggregate prefill tokens/s")
     parser.add_argument("--sim-decode", type=float, default=50, help="Virtual model aggregate decode tokens/s")
@@ -3072,7 +3277,15 @@ def main():
     parser.add_argument("--strict", action="store_true", help="Stop sessions on validation failure; suppress unverified scores")
     parser.add_argument("--timeout", type=float, default=60,
                         help="Initial response deadline (default 60s); later profiles use 4x the previous concurrency maximum")
-    parser.add_argument("--extra-body", type=json.loads, default={})
+    parser.add_argument("--forced-tool-choice", type=boolean, default=True, metavar="BOOL",
+                        help="true (default): each request names the tool to call; false: tool_choice auto, so the "
+                             "model picks the tool and may think first")
+    parser.add_argument("--no-think-prompt", type=boolean, default=True, metavar="BOOL",
+                        help=f"true (default): add to the system prompt {NO_THINK_PROMPT!r}")
+    parser.add_argument("--temperature", type=float,
+                        help="Sampling temperature to send; by default none is sent and the server's default applies")
+    parser.add_argument("--extra-body", type=json.loads, default={},
+                        help="JSON object merged into every chat request, e.g. '{\"top_p\": 0.95}'")
     parser.add_argument("--ui", choices=["auto", "live", "plain"], default="auto",
                         help="Live VT dashboard on interactive terminals; plain logs when redirected")
     parser.add_argument("--color", choices=["auto", "always", "never"], default="auto")
@@ -3080,7 +3293,25 @@ def main():
                         help="Use non-streaming responses; separate prefill/decode estimates will be unavailable")
     parser.add_argument("--output", type=Path,
                         help="Results filename (default realmark-MODEL.json)")
+    parser.add_argument("--max-server-context", type=positive,
+                        help="Total context the server can hold across lanes: each lane stops starting tasks at this "
+                             "divided by C, so high concurrency runs a partial batch instead of overwhelming the server")
+    parser.set_defaults(rules_in_system=True)
     args = parser.parse_args()
+    if args.resume:
+        try:
+            resume_args(parser, args)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            parser.error(f"Could not resume {args.resume}: {exc}")
+    # Every request, the token counts and the saved protocol read these globals, so one assignment covers them.
+    global SYSTEM, TOOLS, RULES_IN_SYSTEM
+    RULES_IN_SYSTEM = args.rules_in_system
+    if args.rules_in_system:
+        SYSTEM = SYSTEM.replace(RULES_SENTENCE, RULES_PROMPT)
+    if args.no_think_prompt:
+        SYSTEM = SYSTEM + "\n" + NO_THINK_PROMPT
+    if not args.forced_tool_choice:
+        TOOLS = AUTO_TOOLS
     args.target_input_words_per_output = TARGET_RATIO
     if args.render:
         try:
@@ -3099,6 +3330,10 @@ def main():
         parser.error("lane counts must be unique")
     if not isinstance(args.extra_body, dict):
         parser.error("extra-body must be a JSON object")
+    if args.temperature is not None:
+        if args.extra_body.get("temperature", args.temperature) != args.temperature:
+            parser.error("--temperature and --extra-body set different temperatures")
+        args.extra_body = {**args.extra_body, "temperature": args.temperature}
     if not math.isfinite(args.stage_prefill_rate) or args.stage_prefill_rate <= 0:
         parser.error("stage-prefill-rate must be positive and finite")
     if args.stage_timeout is not None and (not math.isfinite(args.stage_timeout) or args.stage_timeout < 0):
@@ -3130,6 +3365,7 @@ def main():
             model_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", args.model).strip(".-") or "model"
             args.output = Path(f"realmark-{model_filename}.json")
         client.timeout, client.ratio_tolerance = args.timeout, args.ratio_tolerance
+        client.forced_tool_choice = args.forced_tool_choice
         client.streaming = args.streaming
         control = RunControl()
         client.control = control
@@ -3137,6 +3373,121 @@ def main():
             with TerminalUI(args.model, args.base_url, args.ui, args.color) as ui:
                 client.progress = ui
                 return run_benchmark(args, client, config)
+
+
+def resume_hint(report, output):
+    """Lines telling the user how to finish a stopped run, or nothing."""
+    if not report.get("terminated"):
+        return []
+    script = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else "ripal.py"
+    lines = []
+    for lanes, info in sorted(report.get("stopped_profiles", {}).items(), key=lambda item: int(item[0])):
+        if info["context_tokens"]:
+            lines.append(f"C={lanes} stopped at about {info['context_tokens']:,} tokens of total context "
+                         f"({round(info['context_tokens_per_lane']):,} per stream).")
+    lines.append(f"Resume: python3 {script} --resume {output}")
+    held = {lanes: s["peak_context_tokens"] for lanes, s in report.get("summaries", {}).items()
+            if s.get("peak_context_tokens") and lanes not in report.get("stopped_profiles", {})}
+    if held:
+        lanes = max(held, key=held.get)
+        cap = int(held[lanes]) // 1024 * 1024
+        lines.append(f"Or cap the total context at what C={lanes} held without stopping ({cap:,} tokens). "
+                     f"Levels that cannot fit their full history get a shorter one: "
+                     f"python3 {script} --resume {output} --max-server-context {cap}")
+    return lines
+
+
+# Room one more task takes in a lane: its read result, padding, and the reserve for its answer.
+TASK_CONTEXT_ALLOWANCE = 4096
+
+
+def opening_tokens(client, config):
+    """Prompt tokens of a lane's first request: system prompt, history and start message."""
+    history = history_messages(config, 0)
+    messages = [{"role": "system", "content": SYSTEM}] + history + [{"role": "user", "content": "Start with task ID x."}]
+    try:
+        return client.count_prompt_tokens(messages)
+    except Exception:
+        return math.ceil(HISTORY_TOKENS_PER_WORD * sum(weighted_words(json.dumps(m)) for m in messages))
+
+
+# A capped lane cuts its history before it gives up room for its warmups and this many measured tasks.
+CAPPED_LEVEL_TASKS = 3
+
+
+def fitted_history_words(client, config, warmup_tasks):
+    """The largest history, up to config.history_words, that leaves a lane room for its warmups and
+    CAPPED_LEVEL_TASKS measured tasks under client.context_window. Zero if not even that fits."""
+    if not config.history_words:
+        return 0
+    window = client.context_window
+    full = opening_tokens(client, config)
+    base = opening_tokens(client, replace(config, history_words=0))
+    history = history_messages(config, 0)
+    tasks = sum(call["function"]["name"] == "submit_result" for m in history for call in m.get("tool_calls") or [])
+    per_word = (full - base) / sum(weighted_words(json.dumps(m)) for m in history)
+    # A history task is the same shape as a live one, so its size is the context a live task adds.
+    growth = (full - base) / max(1, tasks)
+    # One more task covers the budget's preview of the next task. max_tokens is the answer reserve.
+    room = (warmup_tasks + CAPPED_LEVEL_TASKS + 1) * growth + config.max_tokens
+    if full + room <= window:
+        return config.history_words
+    words = int((window - room - base) / per_word) if per_word > 0 else 0
+    # history_messages adds whole tasks and can overshoot the estimate. Shrink until it fits.
+    while words > 0 and opening_tokens(client, replace(config, history_words=words)) + room > window:
+        words = int(words * .95)
+    return max(0, words)
+
+
+# Flags a resumed run may change. Every other setting comes from the saved run.
+RESUME_OVERRIDES = {"output", "ui", "color", "api_key_env", "timeout", "max_server_context", "stage_timeout"}
+
+
+def resume_args(parser, args):
+    """Load a stopped run's settings into args, keeping only the levels it did not finish."""
+    raw = json.loads(args.resume.read_text())
+    saved = raw["config"]["benchmark_version"]
+    if saved != VERSION and saved != WORKLOAD_VERSION:
+        raise ValueError(f"saved under {saved}; this script runs {VERSION} and can resume {WORKLOAD_VERSION} or {VERSION}")
+    prior = report_from_telemetry(raw)
+    for key, value in raw["config"]["parameters"].items():
+        if key in ("resume", "render", "card_output", "output") or not hasattr(args, key):
+            continue
+        if key in RESUME_OVERRIDES and getattr(args, key) != parser.get_default(key):
+            continue
+        setattr(args, key, value)
+    if saved in OLD_TEMPERATURE_ZERO:
+        # The saved levels ran at temperature 0, so the resumed ones must too.
+        args.extra_body = {**(args.extra_body or {}), "temperature": 0}
+    # Settings added after a run was saved take the behaviour it ran with.
+    params = raw["config"]["parameters"]
+    args.no_think_prompt = params.get("no_think_prompt", False)
+    args.rules_in_system = params.get("rules_in_system", False)
+    args.forced_tool_choice = params.get("forced_tool_choice", True)
+    stopped = set(prior.get("stopped_profiles", {}))
+    if prior.get("terminated") and raw["runs"]:
+        # The level running when the run stopped is redone even if it has partial measurements.
+        stopped.add(max(raw["runs"], key=lambda key: int(key.split("=")[-1])).split("=")[-1])
+    done = [str(lanes) for lanes in args.lanes if str(lanes) in prior["summaries"] and str(lanes) not in stopped]
+    args._full_lanes = list(args.lanes)
+    args.lanes = [lanes for lanes in args.lanes if str(lanes) not in done]
+    if not args.lanes:
+        raise ValueError("every level already finished; nothing to resume")
+    args._resume_raw = {**raw, "runs": {key: profile for key, profile in raw["runs"].items() if key.split("=")[-1] in done},
+                        "events": [e for e in raw.get("events", []) if e["type"] != "run_stopped"
+                                   and str(e.get("lanes")) not in map(str, args.lanes)]}
+    # The live run takes each level's slowest response from its warmups too: the history prefills.
+    args._resume_maxima = {}
+    for run in prior["runs"] + [{**warm, "sessions": [], "warmup_sessions": warm["sessions"]} for warm in prior["warmup_runs"]]:
+        slowest = max_completed_response_seconds(run)
+        if str(run["lanes"]) in done and slowest is not None:
+            args._resume_maxima[run["lanes"]] = max(slowest, args._resume_maxima.get(run["lanes"], 0))
+    if args.output is None or Path(args.output).resolve() == args.resume.resolve():
+        args.output = args.resume
+        backup = args.resume.with_name(args.resume.stem + ".before-resume.json")
+        # The first backup holds the original stop. A later resume must not replace it.
+        if not backup.exists():
+            backup.write_text(args.resume.read_text())
 
 
 def max_completed_response_seconds(run):
@@ -3199,12 +3550,14 @@ def run_benchmark(args, client, config):
     runs = []
     warmups = []
     profile_padding = {lanes: config.filler_words for lanes in args.lanes}
-    profile_maxima = {}
+    profile_maxima = dict(getattr(args, "_resume_maxima", {}))
+    skipped, history_cuts = {}, {}
     profile_response_words = {}
+    levels = getattr(args, "_full_lanes", args.lanes)
     for repeat, lanes in batch_schedule(args.lanes, args.repeats):
         if stop_requested(client):
             break
-        deadline, previous_lanes, previous_max = profile_timeout(lanes, args.lanes, profile_maxima, args.timeout)
+        deadline, previous_lanes, previous_max = profile_timeout(lanes, levels, profile_maxima, args.timeout)
         client.timeout = deadline
         client.timeout_reference_words = profile_response_words.get(previous_lanes, 256)
         basis = f"4 × {previous_lanes}L max {format_duration(previous_max)}" if previous_max is not None else "initial deadline"
@@ -3217,6 +3570,23 @@ def run_benchmark(args, client, config):
         if ui:
             ui.begin(f"RIPAL-{lanes}L · {args.warmup_tasks} warmup + {batch_config.tasks} measured · deadline {format_duration(deadline)}",
                      lanes, args.warmup_tasks + batch_config.tasks, batch_config.filler_words)
+        client.context_window = context_info["limit"]
+        if args.max_server_context:
+            client.context_window = min(context_info["limit"], args.max_server_context // lanes)
+            words = fitted_history_words(client, batch_config, args.warmup_tasks)
+            if words < batch_config.history_words:
+                batch_config = replace(batch_config, history_words=words)
+                history_cuts[lanes] = {"words": words, "tokens": opening_tokens(client, batch_config)}
+                emit(client, f"RIPAL-{lanes}L history cut to {words:,} words ({history_cuts[lanes]['tokens']:,} opening tokens) "
+                             f"to leave room for tasks under the {client.context_window:,}-token lane cap")
+            need = opening_tokens(client, batch_config) + TASK_CONTEXT_ALLOWANCE
+            if client.context_window < need:
+                skipped[lanes] = (f"--max-server-context {args.max_server_context:,} leaves {client.context_window:,} "
+                                  f"tokens a lane; its history and one task need about {need:,}")
+                emit(client, f"RIPAL-{lanes}L skipped: {skipped[lanes]}")
+                continue
+            emit(client, f"RIPAL-{lanes}L lane context cap {client.context_window:,} tokens "
+                         f"(--max-server-context {args.max_server_context:,} / {lanes})")
         workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
         workload = [make_session(workload_config, index) for index in range(lanes)]
         run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
@@ -3302,13 +3672,13 @@ def run_benchmark(args, client, config):
                               "response_deadline_scaling": "submit_result scales up with source words relative to previous profile maximum; initial reference 256 words",
                               "mix_control": "expected-word padding" if config.adaptive_mix else "fixed", "history_mode": config.history_mode,
                               "seed_policy": "SHA256(base_seed:session:repeat:lanes), warmup and measured task histories concatenated"},
-              "score_formula": "1000 * asinh((completed_weighted_words / measured_seconds) / 10) / asinh(1)",
+              "score_formula": "1000 * asinh((completed_weighted_words / (measured_seconds - 0.5 * thinking_seconds)) / 10) / asinh(1)",
               "score_work_unit_words": SCORE_WORDS,
               "failure_policy": "strict" if args.strict else "continue; load score and accuracy reported separately",
               "quality_method": "character Levenshtein: 1 - distance/max(expected_length, received_length); "
                                 "zero credit for copied source, invalid routing/metadata, or unfinished work",
               "scores": scores, "summaries": summaries, "geometric_mean_score": aggregate,
-              "warmup_runs": warmups, "runs": runs}
+              "warmup_runs": warmups, "runs": runs, "skipped_levels": skipped, "history_cuts": history_cuts}
     write_results(args, client, report)
     if stop_requested(client):
         return client.control.exit_code
@@ -3402,28 +3772,39 @@ def session_from_events(events, lane, cache_policy):
                 choice = body['choices'][0]
                 message = choice['message']
                 entry['generated_words'] = generated_words(message)
-                calls = message.get('tool_calls') or []
-                if choice.get('finish_reason') == 'length':
-                    raise ValueError('generation reached max_tokens')
-                if message.get('content') and str(message['content']).strip():
-                    raise ValueError('expected tool calls only, without explanatory text')
-                if len(calls) != 1 or not calls[0].get('id'):
-                    raise ValueError('expected exactly one tool call')
-                function = calls[0]['function']
-                try:
-                    supplied = json.loads(function['arguments'])
-                except (ValueError, TypeError):
-                    supplied = None
-                issue = validation_issue(stage, function['name'], wanted, supplied)
-                entry['valid'] = issue is None
-                if issue:
-                    entry['validation'] = issue
-                if stage == 'submit_result' and isinstance(supplied, dict) and isinstance(supplied.get('text'), str):
-                    quality = text_quality(wanted['text'], supplied['text'])
-                    quality['received_words'] = len(supplied['text'].split())
-                    quality['copied_payload'] = supplied['text'].split() == target['payload'].split()
-                    entry['text_quality'] = quality
-                    entry['quality_credit'], entry['transform_score'] = submission_credit(fixture, function['name'], supplied)
+                if stage == 'auto':
+                    if choice.get('finish_reason') == 'length':
+                        raise ValueError('generation reached max_tokens')
+                    outcome = auto_call(fixture, message)
+                    entry['valid'], entry['called'] = outcome['issue'] is None, outcome['name']
+                    if outcome['issue']:
+                        entry['validation'] = outcome['issue']
+                    if outcome['submitted']:
+                        entry['submitted'] = True
+                        entry['quality_credit'], entry['transform_score'] = outcome['credit'], outcome['transform']
+                else:
+                    calls = message.get('tool_calls') or []
+                    if choice.get('finish_reason') == 'length':
+                        raise ValueError('generation reached max_tokens')
+                    if message.get('content') and str(message['content']).strip():
+                        raise ValueError('expected tool calls only, without explanatory text')
+                    if len(calls) != 1 or not calls[0].get('id'):
+                        raise ValueError('expected exactly one tool call')
+                    function = calls[0]['function']
+                    try:
+                        supplied = json.loads(function['arguments'])
+                    except (ValueError, TypeError):
+                        supplied = None
+                    issue = validation_issue(stage, function['name'], wanted, supplied)
+                    entry['valid'] = issue is None
+                    if issue:
+                        entry['validation'] = issue
+                    if stage == 'submit_result' and isinstance(supplied, dict) and isinstance(supplied.get('text'), str):
+                        quality = text_quality(wanted['text'], supplied['text'])
+                        quality['received_words'] = len(supplied['text'].split())
+                        quality['copied_payload'] = supplied['text'].split() == target['payload'].split()
+                        entry['text_quality'] = quality
+                        entry['quality_credit'], entry['transform_score'] = submission_credit(fixture, function['name'], supplied)
         except RunCancelled:
             pass
         except Exception as exc:
@@ -3437,6 +3818,11 @@ def session_from_events(events, lane, cache_policy):
         correct = completed and len(last) == 3 and all(r['valid'] for r in last.values())
         dependencies = all(last.get(stage, {}).get('valid') for stage in ('search_records', 'read_file'))
         submit = last.get('submit_result', {})
+        if 'auto' in last:
+            # Auto mode: a keyed submit proves the file was read.
+            submit = next((r for r in reversed(task_requests) if r.get('submitted')), {})
+            dependencies = bool(submit)
+            correct = completed and submit.get('quality_credit') == 1
         load_words = sum(r['generated_words'] for r in task_requests)
         results.append({'task': task, 'source_words': plan['fixture']['words'],
                         'transformation': plan['fixture']['transformation'], 'correct': correct,
@@ -3477,12 +3863,60 @@ def session_from_events(events, lane, cache_policy):
             'interrupted': interrupted, 'error': stop.get('reason') if stop.get('kind') == 'error' else None}
 
 
+def lane_context(events):
+    """A lane's latest context: the last request's estimated prompt, or the last response's prompt plus output."""
+    current = None
+    for event in sorted(events, key=lambda e: e['time']):
+        if event['type'] == 'request' and isinstance(event.get('estimated_prompt_tokens'), int):
+            current = event['estimated_prompt_tokens']
+        elif event['type'] == 'response':
+            usage = event['body'].get('usage') or {}
+            if isinstance(usage.get('prompt_tokens'), int):
+                current = usage['prompt_tokens'] + (usage.get('completion_tokens') or 0)
+    return current
+
+
+def stopped_profile(profile, lanes, params):
+    """How far a concurrency level got before the run stopped."""
+    contexts = [lane_context([e for events in lane['telemetry'].values() for e in events]) for lane in profile['lanes']]
+    known = [c for c in contexts if c is not None]
+    measured = [e for lane in profile['lanes'] for e in lane['telemetry']['run'] if e['type'] == 'task_end']
+    schedule = params.get('task_schedule')
+    tasks = tasks_for_lanes(lanes, schedule) if schedule else params.get('tasks', Config().tasks)
+    openings = []
+    for lane in profile['lanes']:
+        events = sorted((e for events in lane['telemetry'].values() for e in events), key=lambda e: e['time'])
+        # Runs recorded before requests carried an estimate fall back to the first reported prompt.
+        first = next((e['estimated_prompt_tokens'] for e in events
+                      if e['type'] == 'request' and isinstance(e.get('estimated_prompt_tokens'), int)), None)
+        if first is None:
+            first = next((e['body']['usage']['prompt_tokens'] for e in events if e['type'] == 'response'
+                          and isinstance((e['body'].get('usage') or {}).get('prompt_tokens'), int)), None)
+        if first is not None:
+            openings.append(first)
+    usages = [e['body'].get('usage') or {} for lane in profile['lanes'] for events in lane['telemetry'].values()
+              for e in events if e['type'] == 'response']
+    prompts = [(u['prompt_tokens'], (u.get('prompt_tokens_details') or {}).get('cached_tokens')) for u in usages
+               if isinstance(u.get('prompt_tokens'), int)]
+    cached = [(p, c) for p, c in prompts if isinstance(c, int)]
+    return {'context_tokens': sum(known) if known else None,
+            'cache_hit_share': sum(c for _, c in cached) / sum(p for p, _ in cached) if cached else None,
+            'opening_tokens_per_lane': statistics.mean(openings) if openings else None,
+            'context_tokens_per_lane': statistics.mean(known) if known else None,
+            'phase': 'the measured run' if any(e['type'] == 'request' for lane in profile['lanes']
+                                           for e in lane['telemetry']['run']) else 'warmup',
+            'completed_tasks': sum(e.get('status') == 'finished' for e in measured), 'planned_tasks': tasks * lanes}
+
+
 def report_from_telemetry(raw):
     if not isinstance(raw, dict) or raw.get('schema') != SCHEMA:
         raise ValueError(f'Expected {SCHEMA} raw telemetry; run a new benchmark to produce this format')
     header = raw['config']
     params = header['parameters']
     report = {'version': header['benchmark_version'], 'model': header['model'], 'base_url': header['base_url'],
+              'sampling': {'temperature': (params.get('extra_body') or {}).get('temperature',
+                                           0 if header['benchmark_version'] in OLD_TEMPERATURE_ZERO else None),
+                           'forced_tool_choice': params.get('forced_tool_choice', True)},
               'config': header['workload'], 'model_context': header.get('context'),
               'requested_lanes': params.get('lanes', [1, 2, 4]), 'measurement': {
                   'warmup_tasks_per_lane': params.get('warmup_tasks', 2), 'score_work_unit_words': SCORE_WORDS},
@@ -3491,9 +3925,14 @@ def report_from_telemetry(raw):
     report.update(terminated=bool(stopped), interrupted=bool(stopped and stopped['kind'] == 'interrupt'),
                   termination_kind=stopped['kind'] if stopped else None,
                   termination_reason=stopped.get('reason') if stopped else None, suite_complete=not stopped)
+    report['skipped_levels'] = {}
     for event in raw.get('events', []):
         if event['type'] == 'setup_error':
             report['context_error'] = event['message']
+        elif event['type'] == 'level_skipped':
+            report['skipped_levels'][str(event['lanes'])] = event['reason']
+        elif event['type'] == 'history_cut':
+            report.setdefault('history_cuts', {})[str(event['lanes'])] = {'words': event['words'], 'tokens': event['tokens']}
     for key, profile in raw['runs'].items():
         lanes = int(key.split('=')[-1])
         for stage in profile['stages']:
@@ -3548,7 +3987,8 @@ def report_from_telemetry(raw):
                    'stage_budget': {'seconds': stage['params'].get('stage_timeout_seconds'),
                                     'drain_task': (stage.get('cap') or {}).get('task')},
                    'seed': primary[0]['seed'], 'workload_sha256': hashlib.sha256(json.dumps([s['task_results'] for s in primary], sort_keys=True).encode()).hexdigest(),
-                   'score': score(words / SCORE_WORDS, elapsed)}
+                   'think_seconds': run_think_seconds(primary, lanes),
+                   'score': score(words / SCORE_WORDS, scored_seconds(elapsed, run_think_seconds(primary, lanes)))}
             report['runs'].append(run)
     for lanes in report['requested_lanes']:
         group = [r for r in report['runs'] if r['lanes'] == lanes]
@@ -3559,6 +3999,11 @@ def report_from_telemetry(raw):
     values = list(report['scores'].values())
     report['geometric_mean_score'] = (math.exp(statistics.mean(math.log(v) for v in values)) if all(v > 0 for v in values) else 0) if values and all(v is not None for v in values) and not stopped else None
     report['unmeasured_lanes'] = [c for c in report['requested_lanes'] if str(c) not in report['summaries']]
+    # The level running when the run stopped: the highest one with telemetry.
+    running = max(raw['runs'], key=lambda key: int(key.split('=')[-1]), default=None) if stopped else None
+    report['stopped_profiles'] = {key.split('=')[-1]: stopped_profile(profile, int(key.split('=')[-1]), params)
+                                  for key, profile in raw['runs'].items()
+                                  if stopped and (key == running or key.split('=')[-1] not in report['summaries'])}
     report['diagnostics'] = session_diagnostics(raw, transform)
     refresh_report_charts(report)
     report['final_card'] = result_card(report)
@@ -3594,6 +4039,13 @@ def write_results(args, client, report):
     width = min(98, shutil.get_terminal_size((100, 32)).columns - 1)
     raw = export_report(args, report, {"system": SYSTEM, "tools": TOOLS},
                         {"words": SCORE_WORDS, "seconds": SCORE_REFERENCE_SECONDS, "punctuation_weight": .25})
+    prior = getattr(args, "_resume_raw", None)
+    if prior:
+        runs = {**prior["runs"], **raw["runs"]}
+        raw["runs"] = dict(sorted(runs.items(), key=lambda item: int(item[0].split("=")[-1])))
+        raw["events"] = prior["events"] + raw["events"]
+        raw["config"]["parameters"]["lanes"] = args._full_lanes
+        raw["config"]["resumed_from"] = str(args.resume.resolve())
     args.output.write_text(json.dumps(raw, indent=2) + "\n")
     rebuilt = report_from_telemetry(raw)
     report["final_card"] = result_card(rebuilt, width=width)
@@ -3606,6 +4058,8 @@ def write_results(args, client, report):
         print(report["final_card"])
     emit(client, f"Results: {args.output.resolve()}", final=True)
     emit(client, f"Card: {card_path.resolve()}", final=True)
+    for line in resume_hint(rebuilt, args.output):
+        emit(client, line, final=True)
 
 
 if __name__ == "__main__":
