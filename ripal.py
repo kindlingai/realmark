@@ -699,24 +699,31 @@ class TerminalUI:
                 return MUTED
             colored = []
             score_span = None
-            in_table = False
+            in_table = in_chart = False
+            colors = {"title": MUTED, "tick": WARNING, "label": WARNING, "axis": AMBER}
+            def paint_chart(content, base):
+                return CHART_TOKEN.sub(lambda m: f"\x1b[0;{BACKGROUND};{colors[m.lastgroup]}m{m.group(0)}"
+                                                 f"\x1b[0;{BACKGROUND};{base}m", content)
             for line in lines:
-                if "RIPAL Score" in line and "Completed" in line:
-                    score_span = (line.index("RIPAL Score") - 1, line.index("RIPAL Score") - 1 + len("RIPAL Score"))
+                header = line.startswith("│") and all(column in line for column in CARD_COLUMNS)
+                if header:
+                    start = line.index(" Score ")
+                    score_span = (start, start + len(" Score"))
                     in_table = True
                 elif not line.strip("│ "):
-                    in_table = False
+                    in_table = in_chart = False
+                if CHART_TITLE.search(line):
+                    in_chart = True
                 if line.startswith(("╭", "╰")):
                     colored.append(f"\x1b[{BACKGROUND};{WHITE}m{line}\x1b[0m")
                 elif line.startswith("│") and line.endswith("│"):
-                    base = style(line)
+                    base = MUTED if header else style(line)
                     content = line[1:-1]
                     if in_table and score_span:
                         a, b = score_span
                         content = content[:a] + "\x1b[1m" + content[a:b] + "\x1b[22m" + content[b:]
-                    for heading in ("RIPAL Score  ·  Y: points ±1 task-adjusted SD", "Total decode~  ·  Y: tok/s ±1σ", "Total prefill~  ·  Y: tok/s ±1σ"):
-                        content = content.replace(heading,
-                            f"\x1b[0;{BACKGROUND};{MUTED}m{heading}\x1b[0;{BACKGROUND};{base}m")
+                    if in_chart:
+                        content = paint_chart(content, base)
                     colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{base}m{content}\x1b[{WHITE}m│\x1b[0m")
                 else:
                     colored.append(f"\x1b[{BACKGROUND};{style(line)}m{line}\x1b[0m")
@@ -752,15 +759,19 @@ def aggregate_phase(summary, lanes, key):
     return phases.get("aggregate_" + key, int(lanes) * value if value is not None else None)
 
 
-def braille_plot(points, width=32, height=4, errors=None):
-    """Plot actual concurrency on X and autoscale Y to finite observed values."""
+def braille_plot(points, width=32, height=4, errors=None, label=lambda n: f"C={n}", ticks=None, x_range=None,
+                 y_range=None):
+    """Plot points on a linear X and autoscale Y to finite observed values.
+
+    X spans `x_range` (default: the known points) and Y spans `y_range` (default: autoscaled).
+    Labels go at `ticks` (default: every point), formatted by `label`."""
     if width < 1 or height < 1:
         raise ValueError("plot dimensions must be positive")
     points = sorted((n, value if value is not None and math.isfinite(value) else None) for n, value in points)
     if not points or any(n <= 0 for n, _ in points):
-        raise ValueError("positive lane counts are required")
+        raise ValueError("positive X values are required")
     known = [(n, value) for n, value in points if value is not None]
-    xmin, xmax = (known[0][0], known[-1][0]) if known else (points[0][0], points[-1][0])
+    xmin, xmax = x_range or ((known[0][0], known[-1][0]) if known else (points[0][0], points[-1][0]))
     errors = {n: value if value is not None and math.isfinite(value) and value >= 0 else None
               for n, value in (errors or {}).items()}
     low = min((value - max(0, errors.get(n) or 0) for n, value in known), default=0)
@@ -775,20 +786,25 @@ def braille_plot(points, width=32, height=4, errors=None):
     else:
         ymin, ymax = 0, .01
         step = .01
+    if y_range:
+        ymin, ymax = y_range
+        step = (ymax - ymin) / 10
     w, h = width * 2, height * 4
     pixels, labels = set(), [" "] * width
     def position(n, value):
         x = round((n - xmin) / (xmax - xmin) * (w - 1)) if xmax != xmin else w // 2
         y = round(round((ymax - value) / (ymax - ymin), 9) * h) if ymax != ymin else h // 2
         return x, max(0, min(h, y))
+    for n in (ticks if ticks is not None else [n for n, _ in points]):
+        if xmin <= n <= xmax:
+            x, _ = position(n, ymin)
+            text = label(n)[:width]
+            offset = max(0, min(width - len(text), x // 2 - len(text) // 2))
+            labels[offset:offset + len(text)] = text
     previous = None
     for n, value in points:
         if not xmin <= n <= xmax:
             continue
-        x, _ = position(n, ymin)
-        label = str(n)[:width]
-        offset = max(0, min(width - len(label), x // 2 - len(label) // 2))
-        labels[offset:offset + len(label)] = label
         if value is None:
             previous = None
             continue
@@ -860,12 +876,38 @@ def chart_lines(plot, title, unit, spread="±1σ"):
     baseline = "".join(dot if dot != " " else "─" for dot in plot["baseline"])
     result.append(bottom.rjust(gutter) + " └" + baseline)
     result.append(" " * (gutter + 2) + plot["labels"])
-    result.append(f"X: concurrency (C), {plot['x_min']}–{plot['x_max']}")
     return result
 
 
-CARD_COLUMNS = (("C", 3), ("RIPAL Score", 11), ("Decode (tok/s)", 14), ("Prefill (tok/s)", 15),
-                ("Completed", 9), ("Time (s)", 8), ("Match (%)", 10), ("Mix (w / t)", 11))
+CHART_TITLE = re.compile(r"[A-Za-z](?:(?!\s{3})[^·│\u2800-\u28ff])*?  ·  Y: .*?(?=\s{3,}|\s*$)")
+# Inside a chart row: a title, a Y tick (a number before its axis), an X label (C=4, 16K), or axis lines.
+CHART_TOKEN = re.compile(r"(?P<title>" + CHART_TITLE.pattern + r")|(?P<tick>\d[\d,.]*(?= [│└]))"
+                         r"|(?P<label>\bC=\d+\b|\b\d+(?:\.\d+)?K\b)|(?P<axis>[│└─]+)")
+CARD_COLUMNS = ("C", "Score", "Decode (t/s)", "Prefill (t/s)", "Context (t)", "Completed", "Time (s)",
+                "Match (%)", "Mix (w / t)")
+
+
+def context_label(tokens):
+    if not isinstance(tokens, (int, float)) or tokens <= 0:
+        return "—"
+    return f"{tokens / 1000:.0f}K" if tokens >= 1000 else str(round(tokens))
+
+
+def context_cell(summary):
+    total, each = summary.get("peak_context_tokens"), summary.get("peak_context_tokens_per_lane")
+    if total is None or each is None:
+        return "—"
+    return f"{context_label(total)} ({context_label(each)})"
+
+
+def grade(quality):
+    """Letter grade for a match fraction; None without one."""
+    if quality is None:
+        return None
+    percent = round(quality * 100, 1)
+    return next(letter for threshold, letter in ((100, "A+"), (93, "A"), (90, "A-"),
+        (87, "B+"), (83, "B"), (80, "B-"), (77, "C+"), (73, "C"), (70, "C-"),
+        (67, "D+"), (63, "D"), (60, "D-"), (0, "F")) if percent >= threshold)
 
 
 def compact_number(value, width=8, decimals=1):
@@ -896,6 +938,84 @@ def card_rate(summary, lanes, key, width):
     return f"{compact_number(total, number_width)} ({compact_number(each, number_width)})"
 
 
+def context_series(report):
+    """(prompt tokens, match %) per measured task at every C, and
+    (prompt tokens, fresh tokens, seconds to first output) per measured C=1 request."""
+    quality, prefill = [], []
+    for run in report.get("runs", []):
+        for session in run["sessions"]:
+            submits = {}
+            for request in session.get("requests", []):
+                prompt = request.get("tokens", {}).get("prompt_tokens")
+                if not isinstance(prompt, int):
+                    continue
+                if request.get("stage") == "submit_result":
+                    submits[request["task"]] = prompt
+                timing = request.get("phase_timing") or {}
+                if (run["lanes"] == 1 and timing.get("fresh_tokens") is not None
+                        and (timing.get("first_output_seconds") or 0) > 0):
+                    prefill.append((prompt, timing["fresh_tokens"], timing["first_output_seconds"]))
+            for task in session.get("task_results", []):
+                if task["task"] in submits and task.get("load_completed"):
+                    quality.append((submits[task["task"]], 100 * task.get("quality_credit", 0)))
+    return quality, prefill
+
+
+def bucket_points(samples, buckets, reduce, bounds=None):
+    """One point per bucket of equal context width over `bounds` (default: the samples'); empty buckets are gaps."""
+    low, high = bounds or (min(s[0] for s in samples), max(s[0] for s in samples))
+    span = (high - low) / buckets or 1
+    groups = [[] for _ in range(buckets)]
+    for sample in samples:
+        groups[min(buckets - 1, int((sample[0] - low) / span))].append(sample)
+    return [(low + span * (index + .5), reduce(group) if group else None) for index, group in enumerate(groups)], low, high
+
+
+def context_grid(report, width):
+    quality, prefill = context_series(report)
+    gap = 3
+    left_width = (width - gap) // 2
+    right_width = width - gap - left_width
+    def chart(samples, reduce, title, unit, size, y_range=None, marks=()):
+        """`marks` are contexts drawn as an x on the baseline instead of joining the line."""
+        if len(samples) < 2:
+            return [title, "Not enough measured data."]
+        bounds = (min(c for c in [s[0] for s in samples] + list(marks)), max(c for c in [s[0] for s in samples] + list(marks)))
+        def plot(columns):
+            points, low, high = bucket_points(samples, columns, reduce, bounds)
+            # Empty buckets are skipped, so the line joins the buckets on either side.
+            result = braille_plot([p for p in points if p[1] is not None], width=columns, height=4, label=context_label,
+                                  ticks=[low, (low + high) / 2, high], x_range=(low, high), y_range=y_range)
+            known = [p for p in points if p[1] is not None]
+            rows = [list(line) for line in result["lines"] + [result["baseline"]]]
+            for context in marks:
+                column = min(columns - 1, round((context - low) / ((high - low) or 1) * (2 * columns - 1)) // 2)
+                # The x sits on the line, at the value interpolated between the neighbouring buckets.
+                before = [p for p in known if p[0] <= context][-1:] or known[:1]
+                after = [p for p in known if p[0] >= context][:1] or known[-1:]
+                if not before:
+                    continue
+                (x0, y0), (x1, y1) = before[0], after[0]
+                value = y0 if x1 == x0 else y0 + (y1 - y0) * (context - x0) / (x1 - x0)
+                pixel = round((result["y_max"] - value) / ((result["y_max"] - result["y_min"]) or 1) * 4 * len(result["lines"]))
+                rows[min(len(rows) - 1, max(0, pixel // 4))][column] = "x"
+            result["lines"], result["baseline"] = ["".join(row) for row in rows[:-1]], "".join(rows[-1])
+            return result
+        first = plot(max(1, size - 2))
+        gutter = max(*map(len, axis_labels(first)), len(middle_label(first)))
+        return chart_lines(plot(max(1, size - gutter - 2)), title, unit, "")
+    # Zero-match tasks (lookup misses, wrong records) would drag bucket means to nothing; they are marked instead.
+    left = chart([q for q in quality if q[1] > 0], lambda group: statistics.mean(v for _, v in group),
+                 "Match by context (t)", "mean %, x = 0%", left_width, (0, 100),
+                 [context for context, value in quality if value == 0])
+    right = chart(prefill, lambda group: sum(f for _, f, _ in group) / sum(s for _, _, s in group),
+                  "Prefill by context (t)", "t/s, C=1", right_width)
+    height = max(len(left), len(right))
+    left += [""] * (height - len(left))
+    right += [""] * (height - len(right))
+    return [a.ljust(left_width) + " " * gap + b for a, b in zip(left, right)]
+
+
 def chart_grid(summaries, width):
     gap = 3
     left_width = (width - gap) // 2
@@ -908,17 +1028,17 @@ def chart_grid(summaries, width):
         gutter = max(*map(len, axis_labels(plot)), len(middle_label(plot)))
         plot = braille_plot([(int(n), aggregate_phase(s, n, key)) for n, s in summaries],
                             width=right_width - gutter - 2, height=4, errors={int(n): s.get("phase_averages", {}).get("aggregate_" + ("decode_stdev" if key.startswith("decode") else "prefill_stdev")) for n, s in summaries})
-        lines = chart_lines(plot, title, "tok/s")
-        lines += [""] * (8 - len(lines))
+        lines = chart_lines(plot, title, "t/s")
+        lines += [""] * (7 - len(lines))
         if right:
             right.append("")
         right.extend(lines)
     plot = braille_plot([(int(n), s["score"]) for n, s in summaries],
-                        width=1, height=len(right) - 4, errors={int(n): s.get("score_stdev") for n, s in summaries})
+                        width=1, height=len(right) - 3, errors={int(n): s.get("score_stdev") for n, s in summaries})
     gutter = max(*map(len, axis_labels(plot)), len(middle_label(plot)))
     plot = braille_plot([(int(n), s["score"]) for n, s in summaries],
-                        width=left_width - gutter - 2, height=len(right) - 4, errors={int(n): s.get("score_stdev") for n, s in summaries})
-    left = chart_lines(plot, "RIPAL Score", "points", "±1 task-adjusted SD")
+                        width=left_width - gutter - 2, height=len(right) - 3, errors={int(n): s.get("score_stdev") for n, s in summaries})
+    left = chart_lines(plot, "Score", "points", "±1 task-adjusted SD")
     left += [""] * (len(right) - len(left))
     return [a.ljust(left_width) + " " * gap + b for a, b in zip(left, right)]
 
@@ -927,21 +1047,47 @@ def chart_grid(summaries, width):
 def match_label(quality):
     if quality is None:
         return "—"
-    percent = round(quality * 100, 1)
-    grade = next(letter for threshold, letter in ((100, "A+"), (93, "A"), (90, "A-"),
-        (87, "B+"), (83, "B"), (80, "B-"), (77, "C+"), (73, "C"), (70, "C-"),
-        (67, "D+"), (63, "D"), (60, "D-"), (0, "F")) if percent >= threshold)
-    return f"{percent:g}% ({grade})"
+    return f"{round(quality * 100, 1):g}% ({grade(quality)})"
 
 
 def result_card(report, width=98):
-    width = max(sum(size for _, size in CARD_COLUMNS) + 2 * (len(CARD_COLUMNS) - 1) + 4, width)
+    summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
+    notes = report.get("diagnostics", [])
+    superscripts = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
+    def markers(lanes, column):
+        return "".join(str(index).translate(superscripts) for index, note in enumerate(notes, 1)
+                       if int(lanes) in note["lanes"] and column in note["columns"])
+    rows = []
+    for lanes, summary in summaries:
+        mark = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time")}
+        ratio = summary["token_mix"].get("fresh_per_output")
+        words = summary.get("word_mix", {}).get("input_per_output")
+        prefix = "~" if summary.get("mix_excludes_cancelled_filler_usage", False) else ""
+        estimated = summary.get("time_limited")
+        seconds = summary.get("estimated_full_seconds") if estimated else summary.get("mean_seconds")
+        planned = summary.get("planned_tasks", 0)
+        rows.append([
+            str(lanes), compact_number(summary["score"], 9),
+            card_rate(summary, lanes, "decode_tokens_per_second", 14) + mark["decode"],
+            card_rate(summary, lanes, "prefill_tokens_per_second", 15) + mark["prefill"],
+            context_cell(summary),
+            f"{summary.get('load_completed_tasks', planned)}/{planned}",
+            ("~" if estimated else "") + compact_number(seconds, 9, 2) + mark["time"],
+            match_label(summary.get("edit_quality")) + mark["match"],
+            f"{prefix}{compact_number(words, 3)}w/{compact_number(ratio, 3)}t" + mark["mix"]])
+    sizes = [max(len(cell) for cell in column) for column in zip(CARD_COLUMNS, *rows)]
+    width = max(sum(sizes) + 2 * (len(sizes) - 1) + 4, width)
     body = []
     def add(text=""):
         body.append(safe_text(text)[:width - 4])
     heading = ("RealMark Partial Results — SERVER OVERWHELMED" if report.get("termination_kind") == "overload" else
                "RealMark Partial Results — INTERRUPTED" if report.get("interrupted") else "RealMark Results")
     add(f"{heading}  ·  {report['model']}")
+    qualities = [s["edit_quality"] for _, s in summaries if s.get("edit_quality") is not None]
+    overall = report.get("geometric_mean_score")
+    if overall is not None:
+        letter = grade(statistics.mean(qualities)) if qualities else None
+        add(f"RIPAL Score: {overall:,.1f}" + (f"  {letter}" if letter else ""))
     if report.get("terminated") or report.get("interrupted"):
         if report.get("termination_reason"):
             add("Stopped: " + report["termination_reason"])
@@ -964,45 +1110,14 @@ def result_card(report, width=98):
     if report.get("context_error"):
         add("Context setup: " + report["context_error"])
     add()
-    summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
-    def table_row(values):
-        return "  ".join(str(value).rjust(size) for value, (_, size) in zip(values, CARD_COLUMNS))
-    add(table_row([label for label, _ in CARD_COLUMNS]))
-    notes = report.get("diagnostics", [])
-    superscripts = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
-    def markers(lanes, column):
-        return "".join(str(index).translate(superscripts) for index, note in enumerate(notes, 1)
-                       if int(lanes) in note["lanes"] and column in note["columns"])
-    for lanes, summary in summaries:
-        suffix = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time")}
-        ratio = summary["token_mix"].get("fresh_per_output")
-        words = summary.get("word_mix", {}).get("input_per_output")
-        approximate = summary.get("mix_excludes_cancelled_filler_usage", False)
-        prefix = "~" if approximate else ""
-        space = (11 - len(suffix["mix"]) - 3 - len(prefix)) // 2
-        mix = prefix + compact_number(words, space) + "w/" + compact_number(ratio, space) + "t"
-        planned = summary.get("planned_tasks", 0)
-        complete = summary.get("load_completed_tasks", planned)
-        completed = f"{complete}/{planned}"
-        if len(completed) > 9:
-            completed = f"{compact_number(complete, 4, 0)}/{compact_number(planned, 4, 0)}"
-        quality = summary.get("edit_quality")
-        match = match_label(quality)
-        available = 10 - len(suffix["match"])
-        if len(match) > available:
-            match = match.replace(" (", "(")
-        if len(match) > available and quality is not None:
-            match = f"{quality:.0%}(" + match.rsplit("(", 1)[-1]
-        estimated = summary.get("time_limited")
-        seconds = summary.get("estimated_full_seconds") if estimated else summary.get("mean_seconds")
-        elapsed = ("~" if estimated else "") + compact_number(seconds, 8 - int(bool(estimated)) - len(suffix["time"]), 2)
-        add(table_row([str(lanes) if len(str(lanes)) <= 3 else compact_number(int(lanes), 3, 0), compact_number(summary["score"], 9),
-                       card_rate(summary, lanes, "decode_tokens_per_second", 14 - len(suffix["decode"])) + suffix["decode"],
-                       card_rate(summary, lanes, "prefill_tokens_per_second", 15 - len(suffix["prefill"])) + suffix["prefill"],
-                       completed, elapsed + suffix["time"], match + suffix["match"], mix + suffix["mix"]]))
+    for row in [list(CARD_COLUMNS)] + rows:
+        add("  ".join(cell.rjust(size) for cell, size in zip(row, sizes)))
     add()
     if summaries:
         for line in chart_grid(summaries, width - 4):
+            add(line)
+        add()
+        for line in context_grid(report, width - 4):
             add(line)
     else:
         add("No measured scores available.")
@@ -1206,6 +1321,9 @@ class ContextBudget:
 
 
 DEFAULT_TASK_SCHEDULE = [(1, 16), (2, 8), (4, 4)]
+# GLM-5.3's tokenizer gives 1.63 tokens per weighted word of history. Deadlines assume 2.
+HISTORY_TOKENS_PER_WORD = 2
+DEFAULT_HISTORY_WORDS = 40000
 SCORE_WORDS = 1000
 SCORE_REFERENCE_SECONDS = 100
 
@@ -1229,7 +1347,7 @@ def tasks_for_lanes(lanes, schedule):
     return max(eligible)[1]
 
 
-def stage_budget(warmups, workload, tasks, prefill_rate=1000):
+def stage_budget(warmups, workload, tasks, prefill_rate=1000, workload_history_words=0):
     """Forecast fresh input growth and allow observed decode time in parallel."""
     fresh_total, decode_seconds = 0, 0.0
     sources = set()
@@ -1253,7 +1371,7 @@ def stage_budget(warmups, workload, tasks, prefill_rate=1000):
             # Without usable warmup counters, conservatively model uncached history
             # growing through each full three-request tool cycle. No answers leave
             # the harness, and tokenization calls are not generation work.
-            history = 512
+            history = 512 + HISTORY_TOKENS_PER_WORD * workload_history_words
             for task in lane[-tasks:]:
                 data = len(json.dumps({'contents': task['contents'], 'read_padding': task['read_padding'],
                                        'instructions': task['instructions']})) / 3
@@ -1451,6 +1569,39 @@ def repeated_output(words, expected):
     return best
 
 
+# Below this, a block-aligned cache can legitimately hit under half of the previous prompt.
+CACHE_MISS_MIN_PROMPT = 32768
+RECORD_MISMATCH_NOTES = {
+    'distractor': 'Lookup miss (submitted a distractor record)',
+    'distractor_text': "Mixed records (submitted the target's ID with a distractor's text)",
+    'revision': 'Wrong revision (submitted the target with the wrong revision)',
+    'unknown_id': 'Unknown record (submitted an ID that is not in the file)',
+}
+
+
+def record_mismatch(fixture, supplied, text, transform):
+    """Why a submission does not belong to the target record, or None if it does."""
+    target = fixture['target']
+    records = [json.loads(line) for line in fixture['contents'].splitlines()]
+    others = [r for r in records if r['id'] != target['id']]
+    if not isinstance(supplied, dict):
+        return None
+    if any(supplied.get('id') == r['id'] for r in others):
+        return 'distractor'
+    if supplied.get('id') != target['id']:
+        return 'unknown_id'
+
+    def overlap(record):
+        wanted = Counter(transform(record['payload'], fixture['transformation']).split())
+        received = Counter(text.split())
+        return sum((wanted & received).values()) / max(sum(wanted.values()), sum(received.values()), 1)
+    if others and max(map(overlap, others)) > overlap(target):
+        return 'distractor_text'
+    if supplied.get('revision') != target['revision']:
+        return 'revision'
+    return None
+
+
 def session_diagnostics(raw, transform):
     notes = []
     block_counts = []
@@ -1458,7 +1609,7 @@ def session_diagnostics(raw, transform):
     tolerance = raw.get('config', {}).get('parameters', {}).get('ratio_tolerance', .15)
     for level, profile in raw.get('runs', {}).items():
         c = int(level.split('=')[1])
-        findings = {'loop': [], 'corruption': [], 'script': [], 'pressure': [], 'wordmix': []}
+        findings = {'loop': [], 'corruption': [], 'script': [], 'pressure': [], 'wordmix': [], 'record': [], 'misses': []}
         for lane in profile['lanes']:
             events = sorted([e for phase in ('run', 'partial') for e in lane['telemetry'][phase]],
                             key=lambda e: e['elapsed'])
@@ -1486,9 +1637,11 @@ def session_diagnostics(raw, transform):
                     findings['wordmix'].append((lane['lane'], budget['cumulative_ratio']))
             previous = None
             pressure = []
+            # A request whose cache hit covers under half of the previous prompt re-prefilled the history.
+            misses, long_requests, last_prompt = 0, 0, None
             for event in events:
                 if event['type'] == 'history_reset':
-                    previous = None
+                    previous = last_prompt = None
                 if event['type'] != 'response':
                     continue
                 body = event['body']
@@ -1498,6 +1651,11 @@ def session_diagnostics(raw, transform):
                 if isinstance(cached, int) and cached > 0:
                     block_counts.append(cached)
                     block_lanes.add(c)
+                if isinstance(cached, int) and isinstance(prompt, int):
+                    if last_prompt is not None and last_prompt >= CACHE_MISS_MIN_PROMPT:
+                        long_requests += 1
+                        misses += cached < last_prompt * .5
+                    last_prompt = prompt
                 request = requests.get(event.get('request_id'))
                 first = first_times.get(event.get('request_id'))
                 latency = first - request['elapsed'] if first is not None and request else None
@@ -1517,7 +1675,7 @@ def session_diagnostics(raw, transform):
                 ref = f"L{lane['lane']}/T{event['task']}" + (' partial' if event['phase'] == 'partial' else '')
                 choices = body.get('choices') or []
                 message = choices[0].get('message', {}) if choices else {}
-                text = None
+                text = supplied = None
                 for call in message.get('tool_calls') or []:
                     function = call.get('function') or {}
                     if function.get('name') != 'submit_result':
@@ -1532,6 +1690,11 @@ def session_diagnostics(raw, transform):
                         if loop:
                             findings['loop'].append((ref, loop))
                 if not isinstance(text, str) or text == expected:
+                    continue
+                record = record_mismatch(fixture, supplied, text, transform)
+                if record:
+                    # The text belongs to another record, so word overlap with the target says nothing.
+                    findings['record'].append((f"{ref} ({context_label(prompt)})", record))
                     continue
                 loop = repeated_output(text.split(), expected)
                 if loop:
@@ -1552,18 +1715,27 @@ def session_diagnostics(raw, transform):
                     findings['script'].append((ref, scripts.most_common(1)[0][0].lower()))
             if len(pressure) >= 2:
                 findings['pressure'].extend(pressure)
+            if misses >= 2:
+                findings['misses'].append((lane['lane'], misses, long_requests))
         if findings['wordmix']:
             details = ', '.join(f'L{lane} {ratio:.2f}:1' for lane, ratio in findings['wordmix'])
             notes.append({'lanes': [c], 'columns': ['mix'], 'text': f'C={c} planned word mix outside the 2:1 reference ({details}). Fixed overhead or padding prevents the target; use more source words, fewer records, or enable word planning.'})
         if findings['loop']:
             details = '; '.join(f"{ref}: {loop['words']:,} words repeating a {loop['period']}-word motif" for ref, loop in findings['loop'])
             notes.append({'lanes': [c], 'columns': ['decode'], 'text': f'C={c} looping detected — {details}.'})
+        for kind, text in RECORD_MISMATCH_NOTES.items():
+            refs = [ref for ref, found in findings['record'] if found == kind]
+            if refs:
+                notes.append({'lanes': [c], 'columns': ['match'], 'text': f"{text} - {', '.join(refs)}"})
         if findings['corruption']:
             details = ', '.join(f'{ref} ({overlap:.0%} expected-word overlap)' for ref, overlap in findings['corruption'])
             notes.append({'lanes': [c], 'columns': ['match'], 'text': f'C={c} major word corruption — {details}.'})
         if findings['script']:
             details = ', '.join(f'{ref} ({script})' for ref, script in findings['script'])
             notes.append({'lanes': [c], 'columns': ['match'], 'text': f'C={c} unexpected script; possible language switch — {details}.'})
+        if findings['misses']:
+            details = ', '.join(f'L{lane} {misses}/{total}' for lane, misses, total in findings['misses'])
+            notes.append({'lanes': [c], 'columns': ['prefill', 'time'], 'text': f"C={c} prefix cache misses: requests whose cache hit covered under half of the previous prompt ({details}). The server re-prefilled the history, usually because the lanes' contexts exceed its cache."})
         if findings['pressure']:
             notes.append({'lanes': [c], 'columns': ['prefill', 'time'], 'text': f"C={c} cache pressure suspected: repeated cache-hit collapses with ≥3× time to first output ({', '.join(findings['pressure'])}). Queueing can also cause this; server metrics are needed to confirm thrashing."})
     if len(block_counts) >= 3 and len(set(block_counts)) >= 2:
@@ -1574,8 +1746,10 @@ def session_diagnostics(raw, transform):
 
 
 class VirtualClock:
-    def __init__(self, prefill, decode, response_timeouts=False):
+    def __init__(self, prefill, decode, response_timeouts=False, prefill_half_context=None, decode_half_context=None):
         self.prefill, self.decode = prefill, decode
+        # Attention cost: a request's rate halves when its context reaches the half-context size.
+        self.prefill_half_context, self.decode_half_context = prefill_half_context, decode_half_context
         self.enforce_response_deadlines = response_timeouts
         self.now, self.epoch, self.serial = 0.0, real_time.time(), 0
         self.local = threading.local()
@@ -1624,7 +1798,7 @@ class VirtualClock:
         control, deadline, label, timeout = self.local.invocation
         lane = getattr(self.local, 'lane', 0)
         count = body['usage']['completion_tokens']
-        job = {'lane': lane, 'body': body, 'start': self.now, 'control': control, 'deadline': deadline,
+        job = {'lane': lane, 'body': body, 'start': self.now, 'control': control, 'deadline': deadline, 'context': prompt,
                'label': label, 'timeout': timeout, 'prefill': prompt - cached, 'phase': 'prefill',
                'tokens': count, 'produced': 0, 'credit': 0.0, 'first': None, 'last': None,
                'arguments': arguments, 'pending': '', 'on_chunk': on_chunk, 'done': False, 'error': None}
@@ -1665,19 +1839,21 @@ class VirtualClock:
             return
         prefill = [j for j in self.jobs.values() if j['phase'] == 'prefill']
         decode = [j for j in self.jobs.values() if j['phase'] == 'decode']
-        p = self.prefill / max(1, len(prefill))
-        d = self.decode / max(1, len(decode))
-        candidates = [max(0, j['prefill']) / p for j in prefill]
+        def rate(total, jobs, job, half):
+            return total / max(1, len(jobs)) / (1 + job['context'] / half if half else 1)
+        p = {j['lane']: rate(self.prefill, prefill, j, self.prefill_half_context) for j in prefill}
+        d = {j['lane']: rate(self.decode, decode, j, self.decode_half_context) for j in decode}
+        candidates = [max(0, j['prefill']) / p[j['lane']] for j in prefill]
         candidates += [max(0, min(j['tokens'], ((j['produced'] - 1) // 32 + 1) * 32 + 1)
-                           - j['produced'] - j['credit']) / d for j in decode]
+                           - j['produced'] - j['credit']) / d[j['lane']] for j in decode]
         candidates += [max(0, j['deadline'] - self.now) for j in self.jobs.values()]
         if self.stage_control and self.stage_control.deadline and self.stage_control.deadline > self.now + 1e-9:
             candidates.append(self.stage_control.deadline - self.now)
         delta = min(candidates)
         for job in prefill:
-            job['prefill'] -= p * delta
+            job['prefill'] -= p[job['lane']] * delta
         for job in decode:
-            job['credit'] += d * delta
+            job['credit'] += d[job['lane']] * delta
         self.now += delta
         self._cancel()
         for job in prefill:
@@ -1726,9 +1902,11 @@ class VirtualModel:
     supports_stream_cancel = True
     supports_telemetry = True
 
-    def __init__(self, runtime, tools, transform, context_window=262144, cache_block=8192):
+    def __init__(self, runtime, tools, transform, context_window=262144, cache_block=8192, kv_tokens=None):
         self.virtual_clock, self.tools, self.transform = runtime, tools, transform
         self.context_window, self.cache_block = context_window, cache_block
+        # Total prefix-cache capacity shared by all lanes; None is unlimited.
+        self.kv_tokens = kv_tokens
         self.extra, self.cache_policy, self.streaming, self.timeout = {}, 'server-default', True, 60
         self.previous_prompts = {}
         self.message_units = {}
@@ -1777,9 +1955,12 @@ class VirtualModel:
         prompt = self.count_prompt_tokens(messages)
         key = messages[1]['content']
         with self.lock:
-            previous = self.previous_prompts.get(key, 0)
+            previous = self.previous_prompts.pop(key, 0)
             cached = min(prompt, max(0, previous - 4) // self.cache_block * self.cache_block)
+            # Insertion order is recency order: evict the least recently used other lanes.
             self.previous_prompts[key] = prompt
+            while self.kv_tokens and sum(self.previous_prompts.values()) > self.kv_tokens and len(self.previous_prompts) > 1:
+                del self.previous_prompts[next(iter(self.previous_prompts))]
             self.request_counter += 1
             call_id = f'virtual-{self.request_counter}'
         if self.cache_policy == 'disabled':
@@ -1794,7 +1975,7 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v12"
+VERSION = "ripal-v13"
 TARGET_RATIO = 2.0
 WORDS = """amber birch cedar delta ember fern garden harbor island jungle kettle lantern
 maple nectar olive pebble quartz river silver timber umber valley willow yellow zephyr
@@ -1879,6 +2060,8 @@ class Config:
     adaptive_mix: bool = True
     history_mode: str = "full"
     filler: bool = True
+    history_words: int = 0
+    deadline: float | None = None
 
 
 def transform(text, transformation="pig_latin"):
@@ -1937,6 +2120,48 @@ def make_session(config, session, task_offset=0):
                     WORDS, k=config.filler_words))}
         tasks.append(resize_task(task, config, config.words))
     return tasks
+
+
+def history_messages(config, session):
+    """Completed earlier tasks that open a lane's conversation, about config.history_words weighted words.
+
+    Real agent sessions run on long cached histories (see MULTISESSION_CALIBRATION.md in the ripal tree).
+    Each lane gets its own history so lanes cannot share a prefix-cache entry beyond the system prompt.
+    The 2:1 word mix and score credit exclude it; the first request of a lane pays its prefill.
+    """
+    messages, total, index = [], 0.0, 0
+    planner = WordMixPlanner(0, TARGET_RATIO)
+    while total < config.history_words:
+        transformation = TRANSFORMATION_CYCLE[index % len(TRANSFORMATION_CYCLE)]
+        task = resize_task({"record_seed": f"{VERSION}:{config.seed}:{session}:history:{index}:records",
+                            "transformation": transformation}, config, config.words)
+        target = task["target"]
+        path = f"/workspace/session-{session}/history-{index}.jsonl"
+        expected = [
+            ("search_records", {"id": target["id"]}, {"path": path}),
+            ("read_file", {"path": path}, {"contents": task["contents"], "read_padding": "",
+                                           "transformation": transformation,
+                                           "instructions": TRANSFORMATIONS[transformation]}),
+            ("submit_result", {"id": target["id"], "revision": target["revision"],
+                               "text": transform(target["payload"], transformation)}, {"ok": True}),
+        ]
+        padding = planner.plan(expected, index + 1)
+        expected[1][2]["read_padding"] = " ".join(random.Random(
+            f"{config.seed}:{session}:history:{index}:padding").choices(WORDS, k=padding))
+        if index == 0:
+            messages.append({"role": "user", "content": f"Start with task ID {target['id']}."})
+        elif messages[-1]["role"] == "tool":
+            # Link the previous submit to this task, as the live workload does.
+            previous = json.loads(messages[-1]["content"])
+            messages[-1]["content"] = json.dumps({**previous, "next_task_id": target["id"]})
+        for stage, arguments, result in expected:
+            call_id = f"history-{session}-{index}-{stage}"
+            messages.append({"role": "assistant", "content": None, "tool_calls": [{
+                "id": call_id, "type": "function", "function": {"name": stage, "arguments": json.dumps(arguments)}}]})
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(result)})
+        total = sum(weighted_words(json.dumps(m)) for m in messages)
+        index += 1
+    return messages
 
 
 def request_tokens(response, cache_policy="server-default"):
@@ -2095,7 +2320,8 @@ class Client:
         control = cancel_control or getattr(self, "control", None)
         if control:
             control.check()
-        socket_timeout = self.timeout if self.streaming else response_deadline(self, config.words, stage)
+        socket_timeout = max(self.timeout, config.deadline or 0) if self.streaming else (
+            config.deadline or response_deadline(self, config.words, stage))
         with urllib.request.urlopen(request, timeout=socket_timeout) as response:
             with control.watch_response(response) if control else nullcontext():
                 if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
@@ -2108,14 +2334,21 @@ def run_session(client, config, tasks, session, state=None):
     state = state if state is not None else {}
     messages = state.get("messages")
     continued = messages is not None
+    history = state.get("history")
+    if history is None:
+        history = state["history"] = history_messages(config, session)
     if messages is None:
-        messages = [{"role": "system", "content": SYSTEM}]
+        messages = [{"role": "system", "content": SYSTEM}] + history
     messages.append({"role": "user", "content": f"Start with task ID {tasks[0]['target']['id']}."})
     trace = state.get("trace") or Telemetry()
     phase = "filler" if getattr(client, "is_filler", False) else getattr(client, "phase", "warmup")
     phase = "run" if phase == "measured" else phase
+    # The history goes under its own key: word mixes count "messages" as new input.
+    fresh_history = [] if continued else history
     sid = trace.start(phase, params=asdict(config), continued=continued, parent=state.get("sid"),
-                      messages=messages[-1:] if continued else list(messages))
+                      messages=messages[-1:] if continued else [messages[0], messages[-1]],
+                      history=fresh_history)
+    history_prefill = bool(fresh_history)
     calls = retries = completed = attempted = exercised = 0
     usage, requests, task_results = {}, [], []
     error = None
@@ -2125,7 +2358,7 @@ def run_session(client, config, tasks, session, state=None):
     context_reason = None
     ui = getattr(client, "progress", None)
     control = getattr(client, "control", None)
-    initial_input = sum(weighted_words(m.get("content")) for m in (messages[-1:] if continued else messages)
+    initial_input = sum(weighted_words(m.get("content")) for m in (messages[-1:] if continued else [messages[0], messages[-1]])
                         if m.get("role") != "assistant")
     mix_control = WordMixPlanner(initial_input, TARGET_RATIO, config.adaptive_mix, config.filler_words)
     output_reserve = int(getattr(client, "extra", {}).get("max_completion_tokens", getattr(client, "extra", {}).get("max_tokens", config.max_tokens)))
@@ -2148,9 +2381,10 @@ def run_session(client, config, tasks, session, state=None):
             words = task["words"]
             transformation = task["transformation"]
             if compact_before:
-                messages = [{"role": "system", "content": SYSTEM},
-                            {"role": "user", "content": f"Start with task ID {target['id']}."}]
-                trace.emit(sid, phase, "history_reset", task=index + 1, messages=list(messages))
+                # Compaction keeps the seeded history, as a real agent keeps its compacted context.
+                start = {"role": "user", "content": f"Start with task ID {target['id']}."}
+                messages = [{"role": "system", "content": SYSTEM}] + history + [start]
+                trace.emit(sid, phase, "history_reset", task=index + 1, messages=[messages[0], start])
             expected_text = transform(target["payload"], transformation)
             next_id = tasks[index + 1]["target"]["id"] if index + 1 < len(tasks) else None
             expected = [
@@ -2161,7 +2395,7 @@ def run_session(client, config, tasks, session, state=None):
                  {"ok": True, "next_task_id": next_id}),
             ]
             if compact_before:
-                mix_control.input_words += sum(weighted_words(m.get("content")) for m in messages)
+                mix_control.input_words += sum(weighted_words(m.get("content")) for m in (messages[0], messages[-1]))
             padding_words = mix_control.plan(expected, index + 1)
             padding = " ".join(random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
             expected[1][2]["read_padding"] = padding
@@ -2191,6 +2425,9 @@ def run_session(client, config, tasks, session, state=None):
                     requests.append(entry)
                     request_started = time.perf_counter()
                     deadline = response_deadline(client, words, stage)
+                    if history_prefill and deadline is not None:
+                        # The lane's first request prefills the whole history.
+                        deadline += state.get("history_deadline_seconds", 0)
                     entry["deadline_seconds"] = deadline
                     calls += 1
                     request_id = f"{sid}:request:{calls}"
@@ -2204,8 +2441,9 @@ def run_session(client, config, tasks, session, state=None):
                     call = message = None
                     received = False
                     try:
-                        operation = (lambda: client.complete(messages, stage, task_config, on_chunk=chunk_event)) if getattr(
-                            client, "supports_telemetry", False) else (lambda: client.complete(messages, stage, task_config))
+                        call_config = replace(task_config, deadline=deadline)
+                        operation = (lambda: client.complete(messages, stage, call_config, on_chunk=chunk_event)) if getattr(
+                            client, "supports_telemetry", False) else (lambda: client.complete(messages, stage, call_config))
                         response = control.call(operation, deadline, stage) if control else operation()
                         received = True
                         trace.emit(sid, phase, "response", task=index + 1, request_id=request_id, body={k: v for k, v in response.items() if k != "_stream_timing"})
@@ -2283,6 +2521,7 @@ def run_session(client, config, tasks, session, state=None):
                                  "message": f"{type(exc).__name__}: {exc}"}
                     entry["seconds"] = time.perf_counter() - request_started
                     entry["received_response"] = received
+                    history_prefill = False
                     entry["valid"] = issue is None
                     if ui:
                         ui.request_done(session, entry["seconds"], entry["tokens"])
@@ -2462,7 +2701,8 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
         if virtual:
             virtual.resume_lanes()
         if stage_prefill_rate is not None:
-            time_budget.update(stage_budget(warmup_sessions, workload, config.tasks, stage_prefill_rate))
+            time_budget.update(stage_budget(warmup_sessions, workload, config.tasks, stage_prefill_rate,
+                                             config.history_words))
             if stage_timeout is not None:
                 time_budget.update(seconds=stage_timeout, override=True)
             stage_control.start(time_budget["seconds"])
@@ -2486,7 +2726,9 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
         if virtual:
             virtual.enter_lane(index)
         barrier.wait()
-        state = {}
+        # Lanes prefill their histories together, so each gets a share of the prefill floor.
+        state = {"history_deadline_seconds": HISTORY_TOKENS_PER_WORD * config.history_words * lanes
+                 / (stage_prefill_rate or 1000)}
         if warmup_tasks:
             warm_config = replace(config, tasks=warmup_tasks, filler=False)
             warm_client = PhaseClient(stage_client, "warmup")
@@ -2683,6 +2925,7 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
                 if projected_completions and all(value is not None for value in projected_completions) else None,
             "api_errors": sum(api_error_counts(sessions).values()),
             "edit_quality": quality,
+            **peak_context(runs),
             "text_edit_distance": sum(task["text_quality"]["distance"] for s in sessions
                                       for task in s.get("task_results", []) if task.get("text_quality")),
             "response_failures": sum(s.get("response_failures", 0) for s in sessions),
@@ -2712,6 +2955,18 @@ def summarize(runs, lanes, bootstrap_samples=5000, seed=42, warmup_valid=True,
             "note": "Approximate percentile bootstrap CI; no outliers removed. Single-run uncertainty is unavailable."}
 
 
+def peak_context(runs):
+    """Largest prompt per lane: summed over a run's lanes (averaged over runs) and averaged per lane."""
+    def peak(session):
+        return max((r["tokens"]["prompt_tokens"] for r in session.get("requests", [])
+                    if isinstance(r.get("tokens", {}).get("prompt_tokens"), int)), default=None)
+    peaks = [[peak(s) for s in run["sessions"]] for run in runs]
+    if not peaks or any(None in run for run in peaks):
+        return {"peak_context_tokens": None, "peak_context_tokens_per_lane": None}
+    return {"peak_context_tokens": statistics.mean(map(sum, peaks)),
+            "peak_context_tokens_per_lane": statistics.mean(p for run in peaks for p in run)}
+
+
 def positive(value):
     number = int(value)
     if number < 1:
@@ -2732,6 +2987,13 @@ def main():
     parser.add_argument("--sim-context", type=positive, default=1048576, help="Virtual model context capacity")
     parser.add_argument("--sim-response-timeouts", action="store_true", help="Apply response deadlines to virtual requests")
     parser.add_argument("--sim-cache-block", type=positive, default=8192, help="Virtual model prefix-cache block size")
+    parser.add_argument("--sim-prefill-half-context", type=int, default=131072,
+                        help="Context at which a virtual request's prefill rate halves; 0 makes prefill context-free")
+    parser.add_argument("--sim-decode-half-context", type=int, default=131072,
+                        help="Context at which a virtual request's decode rate halves; 0 makes decode context-free")
+    parser.add_argument("--sim-kv-tokens", type=int, default=0,
+                        help="Virtual prefix-cache capacity shared by all lanes; least recently used lanes are "
+                             "evicted. 0 is unlimited")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY",
                         help="API key environment variable (default OPENAI_API_KEY); never saved in results")
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
@@ -2742,6 +3004,10 @@ def main():
     parser.add_argument("--ratio-tolerance", type=float, default=.15,
                         help="Relative tolerance around the 2:1 visible-word ratio, default ±15%%")
     parser.add_argument("--filler-words", type=int, default=Config().filler_words)
+    parser.add_argument("--history-words", type=int, default=DEFAULT_HISTORY_WORDS,
+                        help="Weighted words of earlier completed tasks that open each lane's conversation, "
+                             f"default {DEFAULT_HISTORY_WORDS:,} (about 65K GLM tokens); 0 disables. "
+                             "Prefilled during warmup; excluded from the word mix and score.")
     parser.add_argument("--context-window", type=positive,
                         help="Context limit override if /models does not advertise it; lower limits are allowed")
     parser.add_argument("--no-filler", dest="filler", action="store_false",
@@ -2795,6 +3061,8 @@ def main():
         parser.error("retries and warmup-tasks must be nonnegative; timeout must be positive and finite")
     if args.filler_words < 0 or not math.isfinite(args.ratio_tolerance) or not 0 < args.ratio_tolerance < 1:
         parser.error("filler-words must be nonnegative and ratio-tolerance must be between 0 and 1")
+    if args.history_words < 0:
+        parser.error("history-words must be nonnegative")
     if len(args.lanes) != len(set(args.lanes)):
         parser.error("lane counts must be unique")
     if not isinstance(args.extra_body, dict):
@@ -2811,16 +3079,17 @@ def main():
                 tasks_for_lanes(lanes, args.task_schedule)
         except ValueError as exc:
             parser.error(str(exc))
-    config = Config(**{name: getattr(args, name) for name in Config.__dataclass_fields__})
+    config = Config(**{name: getattr(args, name) for name in Config.__dataclass_fields__ if hasattr(args, name)})
     if not all(math.isfinite(v) and v > 0 for v in (args.sim_prefill, args.sim_decode)):
         parser.error("simulator rates must be positive and finite")
-    runtime = VirtualClock(args.sim_prefill, args.sim_decode, args.sim_response_timeouts) if args.simulate else None
+    runtime = VirtualClock(args.sim_prefill, args.sim_decode, args.sim_response_timeouts,
+                           args.sim_prefill_half_context, args.sim_decode_half_context) if args.simulate else None
     with runtime if runtime else nullcontext():
         if runtime:
             args.model, args.base_url, args.ui = "virtual-model", "virtual://local", "plain"
             if args.stage_timeout is None:
                 args.stage_timeout = 0
-            client = VirtualModel(runtime, TOOLS, transform, args.sim_context, args.sim_cache_block)
+            client = VirtualModel(runtime, TOOLS, transform, args.sim_context, args.sim_cache_block, args.sim_kv_tokens or None)
             client.extra, client.cache_policy = args.extra_body, args.cache_policy
         else:
             client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),

@@ -1,4 +1,4 @@
-# Word-based workload (protocol v12)
+# Word-based workload (protocol v13)
 
 The default load targets **2 weighted words of newly supplied input per expected
 visible output word**. Words/identifiers count as 1; non-whitespace punctuation
@@ -31,3 +31,31 @@ word-mix verification tolerance (default 15%). The old token-ratio calibration a
 
 The archived Flash-Lite benchmark uses protocol v11's token-based sizing. Its raw
 log and recorded card are retained unchanged; it is not a v12 reference run.
+
+## Seeded history (v13)
+
+Each lane's conversation opens with about **40,000 weighted words** (`--history-words`,
+about 65K GLM-5.3 tokens) of earlier completed tasks: the same three tool calls per task,
+with correct answers and `ok: true` results. Real agent sessions run on long cached
+contexts: across 30 sampled Claude Code sessions, the median of per-session median context
+was 188K tokens (10th percentile 60K), and cache reads were 98.6% of input. Without a
+history, RealMark contexts stayed at a few thousand to tens of thousands of tokens, so
+attention cost and prefix-cache capacity barely mattered.
+
+Each lane gets its own history, so lanes share only the system prompt in a prefix cache.
+The 2:1 word mix and the score both exclude the history. The first warmup request of
+each lane prefills it, and that request's deadline grows by 2 tokens per history word
+times the lane count, divided by the stage prefill floor (1,000 tokens/s by default). With `--warmup-tasks 0` the measured time includes that prefill. Compaction
+(`--history task`) keeps the history. `--history-words 0` restores the v12 workload,
+although v13 task seeds differ.
+
+The card notes when a lane's cache hits cover under half of its previous prompt
+(prompts of 32,768 tokens and more): the server is re-prefilling the history, usually
+because the lanes' contexts exceed its cache.
+
+## Simulator context costs
+
+`--simulate` now slows a request as its context grows: its prefill and decode rates halve
+at `--sim-prefill-half-context` and `--sim-decode-half-context` tokens (131,072 each by
+default; 0 turns the effect off). `--sim-kv-tokens` caps the prefix cache shared by all
+lanes and evicts the least recently used lanes; 0 (the default) is unlimited.
