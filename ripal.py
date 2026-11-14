@@ -1365,8 +1365,18 @@ class ContextBudget:
         self.source = "server tokenizer"
         self.peak_prompt = 0
         self.peak_reserved = 0
+        # The messages of the last exact count and that count. Conversations only grow, so later checks
+        # count those messages exactly and estimate just the newer ones.
+        self.counted = None
 
     def count(self, messages):
+        if self.counted is not None:
+            prefix, exact = self.counted
+            if len(prefix) <= len(messages) and messages[:len(prefix)] == prefix:
+                # The tokenizer runs inside the measured time, so it is skipped while this bound fits.
+                bound = exact + self.size_estimate(messages[len(prefix):])
+                if bound + self.output_tokens + self.margin <= self.limit:
+                    return bound
         if self.tokenizer_available is not False and hasattr(self.client, "count_prompt_tokens"):
             try:
                 control = getattr(self.client, "control", None)
@@ -1375,6 +1385,8 @@ class ContextBudget:
                 if not isinstance(count, int) or isinstance(count, bool) or count < 0:
                     raise ValueError("Invalid token count")
                 self.tokenizer_available = True
+                # A copy by value: a message changed in place then no longer matches the prefix.
+                self.counted = (json.loads(json.dumps(messages)), count)
                 return count
             except RunCancelled:
                 raise
@@ -1390,6 +1402,11 @@ class ContextBudget:
         self.source = "conservative UTF-8 size estimate (tokenizer unavailable)"
         encoded = json.dumps({"messages": messages, "tools": self.tools}, ensure_ascii=False).encode()
         return len(encoded) + 32 * len(messages) + 128
+
+    @staticmethod
+    def size_estimate(messages):
+        """A conservative token count for messages: their UTF-8 size plus 32 per message."""
+        return len(json.dumps(messages, ensure_ascii=False).encode()) + 32 * len(messages)
 
     def check(self, messages, label="request"):
         if not self.limit:
