@@ -28,7 +28,7 @@ a doubled score.
 
 Note that RIPAL scores are not based on tokens as tokenization varies between models. Instead, RIPAL uses words,
 and tasks based around transformations of whole words. Tasks are calibrated against the input and output word/token
-counts of real agentic work streams.
+counts of real agentic work streams. 
 
 The score is defined as:
 
@@ -53,6 +53,14 @@ The headline score is the geometric mean over the concurrency levels $\mathcal{C
 $$
 S = \left( \prod_{C \in \mathcal{C}} S_C \right)^{1/|\mathcal{C}|}
 $$
+
+### A Note on Thinking
+
+The prompts ask the model not to think, but some models require a minimum
+amount of thinking to return correct answers. If the model does end up thinking to answer, the thinking time
+is penalized half as much as generation time - the penalty is designed to factor in thinking time without
+putting all non-thinking models above all thinking models. $0.5$ was effectively picked as the half-way compromise between
+"thinking should not be penalized" and "thinking should be fully penalized"
 
 ## Quality Score
 
