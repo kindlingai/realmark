@@ -336,10 +336,11 @@ def read_stream(response, started, control=None, on_chunk=None):
     message = {"role": "assistant", "content": None}
     calls, result, data = {}, {}, []
     first = last = None
+    visible_chunks = visible_chars = first_chars = 0
     finish_reason = None
     done = False
     def consume(payload):
-        nonlocal first, last, finish_reason, done
+        nonlocal first, last, visible_chunks, visible_chars, first_chars, finish_reason, done
         if on_chunk:
             on_chunk(payload, time.perf_counter())
         if payload == "[DONE]":
@@ -354,12 +355,14 @@ def read_stream(response, started, control=None, on_chunk=None):
                 continue
             delta = choice.get("delta") or {}
             generated = False
+            chars = 0
             for key in ("content", "reasoning_content", "reasoning"):
                 value = delta.get(key)
                 if isinstance(value, str) and value:
                     target = "reasoning_content" if key == "reasoning" else key
                     message[target] = (message.get(target) or "") + value
                     generated = True
+                    chars += len(value)
             for part in delta.get("tool_calls") or []:
                 call = calls.setdefault(part.get("index", 0), {"id": "", "type": "function",
                                         "function": {"name": "", "arguments": ""}})
@@ -372,11 +375,15 @@ def read_stream(response, started, control=None, on_chunk=None):
                         if key != "name" or fragment != call["function"][key]:
                             call["function"][key] += fragment
                         generated = True
+                        chars += len(fragment)
             if generated:
                 now = time.perf_counter()
                 if first is None:
                     first = now
+                    first_chars = chars
                 last = now
+                visible_chunks += 1
+                visible_chars += chars
             if choice.get("finish_reason") is not None:
                 finish_reason = choice["finish_reason"]
     for raw in response:
@@ -401,16 +408,56 @@ def read_stream(response, started, control=None, on_chunk=None):
     result["_stream_timing"] = {"source": "visible streaming deltas",
         "first_output_seconds": first - started if first is not None else None,
         "generation_seconds": last - first if first is not None else None,
+        "visible_chunks": visible_chunks, "visible_chars": visible_chars, "first_chunk_chars": first_chars,
         "response_seconds": time.perf_counter() - started}
     return result
+
+
+# A server that holds the whole reply and sends it in one burst leaves first-to-last visible chunk near zero, which
+# turns decode into millions of tokens a second. Streams send a few tokens a chunk (the virtual model 32), and no
+# server decodes one stream at thousands of tokens a second, so a multi-token reply in one chunk, more than 64
+# tokens a chunk, or a rate over 5,000 tokens a second counts as buffered: no decode timing.
+BUFFERED_TOKENS_PER_CHUNK = 64
+BUFFERED_TOKENS_PER_SECOND = 5000
+
+
+def stream_buffered(timing, output_tokens):
+    if not output_tokens or output_tokens <= 1:
+        return False
+    chunks, seconds = timing.get("visible_chunks"), timing.get("generation_seconds")
+    if chunks is not None and (chunks <= 1 or output_tokens / chunks > BUFFERED_TOKENS_PER_CHUNK):
+        return True
+    return seconds is not None and (seconds <= 0 or decode_tokens(timing, output_tokens) / seconds > BUFFERED_TOKENS_PER_SECOND)
 
 
 def phase_timing(response, tokens):
     timing = response.get("_stream_timing")
     if not timing:
         return None
-    return {**timing, "fresh_tokens": tokens.get("fresh_tokens"),
-            "output_tokens": tokens.get("output_tokens")}
+    timing = dict(timing)
+    output = tokens.get("output_tokens")
+    if stream_buffered(timing, output):
+        timing.update(generation_seconds=None, buffered=True)
+    return {**timing, "fresh_tokens": tokens.get("fresh_tokens"), "output_tokens": output,
+            "decode_tokens": decode_tokens(timing, output)}
+
+
+def decode_tokens(timing, output):
+    """The output tokens that arrived after the first visible chunk, the ones the decode window times. A stream of
+    one token a chunk gives output - 1; a chunky stream gives its share of the visible characters past the first
+    chunk, since the first chunk lands before the window opens."""
+    if not output or output <= 1:
+        return 0
+    chars, head = timing.get("visible_chars"), timing.get("first_chunk_chars")
+    if not chars or head is None:
+        return output - 1
+    return min(output - 1, output * (chars - head) / chars)
+
+
+def sample_decode_tokens(sample):
+    # samples saved before decode_tokens existed count every token past the first
+    tokens = sample.get("decode_tokens")
+    return tokens if tokens is not None else sample["output_tokens"] - 1
 
 
 def average_phases(sessions, lanes=1):
@@ -420,7 +467,7 @@ def average_phases(sessions, lanes=1):
     prefill = [s for s in samples if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
     decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
     prefill_rate = sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None
-    decode_rate = sum(s["output_tokens"] - 1 for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
+    decode_rate = sum(sample_decode_tokens(s) for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
     task_samples = []
     for session in sessions:
         finished = {t["task"] for t in session.get("task_results", []) if t.get("load_completed")}
@@ -439,7 +486,7 @@ def average_phases(sessions, lanes=1):
         if inputs:
             prefill_values.append(sum(s["fresh_tokens"] for s in inputs) / sum(s["first_output_seconds"] for s in inputs))
         if outputs:
-            decode_values.append(sum(s["output_tokens"] - 1 for s in outputs) / sum(s["generation_seconds"] for s in outputs))
+            decode_values.append(sum(sample_decode_tokens(s) for s in outputs) / sum(s["generation_seconds"] for s in outputs))
     return {
         "prefill_stdev": statistics.stdev(prefill_values) if len(prefill_values) > 1 else None,
         "decode_stdev": statistics.stdev(decode_values) if len(decode_values) > 1 else None,
@@ -1186,6 +1233,13 @@ def result_card(report, width=98):
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
+    timed = [(r.get("phase_timing") or {}) for run in report.get("runs", []) for s in run["sessions"]
+             for r in s.get("requests", []) if r.get("phase_timing")]
+    buffered = sum(1 for t in timed if t.get("buffered"))
+    if buffered:
+        for line in textwrap.wrap(f"Decode: {buffered} of {len(timed)} replies arrived in one burst (the server buffers "
+                                  "its stream), so they give no decode rate.", width=width - 4):
+            add(line)
     if notes:
         add("Notes")
         for index, note in enumerate(notes, 1):
@@ -1434,8 +1488,17 @@ def stage_budget(warmups, workload, tasks, prefill_rate=1000, workload_history_w
             if samples and all(value is not None and math.isfinite(value) for value in samples):
                 decode = sum(samples) / completed * tasks
             else:
-                decode = 0
-                sources.add('decode allowance unavailable without streaming timings')
+                # No decode timing (buffered or non-streamed replies): the last warmup task's response time past its
+                # prefill at the floor rate. The first task carries the cold start, so it would inflate the allowance.
+                last = [r for r in requests if r.get('task') == max(r.get('task', 0) for r in requests)]
+                spent = [(r.get('phase_timing') or {}).get('response_seconds') for r in last]
+                if last and all(value is not None for value in spent):
+                    decode = tasks * sum(max(0.0, value - (r.get('tokens', {}).get('fresh_tokens') or 0) / prefill_rate)
+                                         for value, r in zip(spent, last))
+                    sources.add('decode allowance from warmup response times (no streaming decode timings)')
+                else:
+                    decode = 0
+                    sources.add('decode allowance unavailable without streaming timings')
             decode_seconds = max(decode_seconds, decode)
     raw_seconds = fresh_total / prefill_rate + decode_seconds
     seconds = max(60, math.ceil(raw_seconds / 60) * 60)
@@ -3698,22 +3761,27 @@ def refresh_report_charts(report):
 
 def timing_from_events(events, request):
     first = last = None
+    visible_chunks = visible_chars = first_chars = 0
     for event in events:
         if event['type'] != 'stream_chunk' or event.get('request_id') != request['request_id'] or event['data'] == '[DONE]':
             continue
         chunk = json.loads(event['data'])
-        visible = False
+        chars = 0
         for choice in chunk.get('choices', []):
             delta = choice.get('delta') or {}
-            visible |= any(bool(delta.get(key)) for key in ('content', 'reasoning', 'reasoning_content'))
+            chars += sum(len(delta.get(key) or '') for key in ('content', 'reasoning', 'reasoning_content'))
             for call in delta.get('tool_calls') or []:
                 function = call.get('function') or {}
-                visible |= bool(function.get('name') or function.get('arguments'))
-        if visible:
-            first = event['elapsed'] if first is None else first
+                chars += len(function.get('name') or '') + len(function.get('arguments') or '')
+        if chars:
+            if first is None:
+                first, first_chars = event['elapsed'], chars
             last = event['elapsed']
+            visible_chunks += 1
+            visible_chars += chars
     return {'source': 'raw stream timestamps', 'first_output_seconds': first - request['elapsed'] if first is not None else None,
-            'generation_seconds': last - first if first is not None else None}
+            'generation_seconds': last - first if first is not None else None, 'visible_chunks': visible_chunks,
+            'visible_chars': visible_chars, 'first_chunk_chars': first_chars}
 
 
 def session_from_events(events, lane, cache_policy):
