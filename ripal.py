@@ -773,7 +773,8 @@ class TerminalUI:
                         content = paint_chart(content, base)
                     colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{base}m{content}\x1b[{WHITE}m│\x1b[0m")
                 else:
-                    colored.append(f"\x1b[{BACKGROUND};{style(line)}m{line}\x1b[0m")
+                    # Footnotes below the box keep the terminal's own background.
+                    colored.append(f"\x1b[{MUTED}m{line}\x1b[0m")
             lines = colored
         with self.lock:
             self.finals.extend(lines)
@@ -1240,16 +1241,17 @@ def result_card(report, width=98):
         for line in textwrap.wrap(f"Decode: {buffered} of {len(timed)} replies arrived in one burst (the server buffers "
                                   "its stream), so they give no decode rate.", width=width - 4):
             add(line)
-    if notes:
-        add("Notes")
-        for index, note in enumerate(notes, 1):
-            label = str(index).translate(superscripts) + " "
-            for line in textwrap.wrap(note["text"], width=width - 4, initial_indent=label,
-                                      subsequent_indent=" " * len(label)):
-                add(line)
+    while body and not body[-1]:
+        body.pop()
+    # Footnotes go below the box, indented to line up with the text inside it.
+    footnotes = []
+    for index, note in enumerate(notes, 1):
+        label = "  " + str(index).translate(superscripts) + " "
+        footnotes += textwrap.wrap(note["text"], width=width, initial_indent=label,
+                                   subsequent_indent=" " * len(label))
     return "\n".join(["╭" + "─" * (width - 2) + "╮"] +
                      ["│ " + line.ljust(width - 4) + " │" for line in body] +
-                     ["╰" + "─" * (width - 2) + "╯"])
+                     ["╰" + "─" * (width - 2) + "╯"] + footnotes)
 
 
 class FillerProgress:
