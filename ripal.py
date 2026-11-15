@@ -1129,8 +1129,10 @@ def result_card(report, width=98):
     stopped = report.get("stopped_profiles", {})
     notes = report.get("diagnostics", []) + [
         {"lanes": [int(lanes)], "columns": ["context"],
-         "text": f"C={lanes} stopped during {info['phase']} at about {context_label(info['context_tokens'])} total context "
-                 f"({context_label(info['context_tokens_per_lane'])} per stream): {report.get('termination_reason') or 'run stopped'}"
+         "text": f"C={lanes} stopped during {info['phase']}"
+                 + (f" at about {context_label(info['context_tokens'])} total context "
+                    f"({context_label(info['context_tokens_per_lane'])} per stream)" if info.get('context_tokens') else "")
+                 + f": {report.get('termination_reason') or 'run stopped'}"
                  + (f". Prefix cache hits: {info['cache_hit_share']:.0%} of prompt tokens"
                     if info.get('cache_hit_share') is not None else "")}
         for lanes, info in sorted(stopped.items(), key=lambda item: int(item[0]))] + [
@@ -1230,6 +1232,8 @@ def result_card(report, width=98):
     if report.get("context_error"):
         add("Context setup: " + report["context_error"])
     for lanes, reason in sorted(report.get("skipped_levels", {}).items(), key=lambda item: int(item[0])):
+        if reason == report.get("termination_reason"):
+            reason = "the run stopped before it measured anything"
         for line in textwrap.wrap(f"C={lanes} not run: {reason}.", width=width - 4, subsequent_indent="  "):
             add(line)
     add()
@@ -2503,11 +2507,16 @@ def retry_rate_limits(operation, client, label, retry=True):
             if not retry or not is_rate_limit(exc):
                 raise
         emit(client, f"HTTP 429 during {label}; retrying in {RATE_LIMIT_WAIT_SECONDS}s (warmup is unscored)")
-        until = real_time.monotonic() + RATE_LIMIT_WAIT_SECONDS
-        while (left := until - real_time.monotonic()) > 0:
-            if control:
-                control.check()
-            real_time.sleep(min(.25, left))
+        pause(control, RATE_LIMIT_WAIT_SECONDS)
+
+
+def pause(control, seconds):
+    """Sleeps in real time, which Ctrl-C interrupts with RunCancelled."""
+    until = real_time.monotonic() + seconds
+    while (left := until - real_time.monotonic()) > 0:
+        if control:
+            control.check()
+        real_time.sleep(min(.25, left))
 
 
 def max_tokens_reason(stage, response, extra, max_tokens, auto):
@@ -2588,12 +2597,12 @@ class Client:
         if protected.intersection(self.extra):
             raise ValueError(f"extra-body cannot override {sorted(protected)}")
 
-    def json_request(self, url, body=None):
+    def json_request(self, url, body=None, timeout=None):
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
             return json.load(response)
 
     def discover_context_limit(self):
@@ -2607,10 +2616,10 @@ class Client:
                 return {"limit": limit, "source": f"/models {field}"}
         raise ValueError("Model metadata has no context limit; supply --context-window")
 
-    def ping(self):
+    def ping(self, text, timeout):
         extra = {k: v for k, v in self.extra.items() if k != "max_completion_tokens"}
         return self.json_request(self.url, {**extra, "model": self.model, "max_tokens": 16, "stream": False,
-                                            "messages": [{"role": "user", "content": "Hi there!"}]})
+                                            "messages": [{"role": "user", "content": text}]}, timeout)
 
     def count_prompt_tokens(self, messages):
         root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
@@ -3122,6 +3131,13 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
         finally:
             if virtual:
                 virtual.pause_lane(index)
+    # Warmup starts with the first-request gate. On failure the lanes see the stopped control and record the stop.
+    try:
+        problem = first_requests(PhaseClient(client, "warmup"), lanes, getattr(client, "first_request_retries", 3))
+    except RunCancelled:
+        problem = None
+    if problem:
+        client.control.terminate("overload", problem)
     with ThreadPoolExecutor(max_workers=lanes) as pool:
         futures = [pool.submit(dispatched, index, tasks) for index, tasks in enumerate(workload)]
         sessions = [future.result() for future in futures]
@@ -3438,6 +3454,10 @@ def main():
         parser.add_argument("--" + name.replace("_", "-"), type=positive,
                             default=getattr(Config(), name))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--first-request-retries", type=int, default=3, metavar="N",
+                        help="Each level starts with a short request on every lane. When some lane gets no answer "
+                             f"within {FIRST_REQUEST_SECONDS}s, wait {FIRST_REQUEST_RETRY_SECONDS}s and retry, up to N "
+                             "times (default 3), then stop the run")
     parser.add_argument("--retries", type=int, default=Config().retries,
                         help="Optional diagnostic retries per tool; default 0 (one attempt, then continue)")
     parser.add_argument("--strict", action="store_true", help="Stop sessions on validation failure; suppress unverified scores")
@@ -3486,8 +3506,10 @@ def main():
             parser.error(f"Could not render {args.render}: {exc}")
     if args.card_output:
         parser.error("--card-output requires --render")
-    if args.retries < 0 or args.warmup_tasks < 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("retries and warmup-tasks must be nonnegative; timeout must be positive and finite")
+    if (args.retries < 0 or args.warmup_tasks < 0 or args.first_request_retries < 0 or not math.isfinite(args.timeout)
+            or args.timeout <= 0):
+        parser.error("retries, first-request-retries and warmup-tasks must be nonnegative; timeout must be positive "
+                     "and finite")
     if args.filler_words < 0 or not math.isfinite(args.ratio_tolerance) or not 0 < args.ratio_tolerance < 1:
         parser.error("filler-words must be nonnegative and ratio-tolerance must be between 0 and 1")
     if args.history_words < 0:
@@ -3606,7 +3628,8 @@ def fitted_history_words(client, config, warmup_tasks):
 
 
 # Flags a resumed run may change. Every other setting comes from the saved run.
-RESUME_OVERRIDES = {"output", "ui", "color", "api_key_env", "timeout", "max_server_context", "stage_timeout"}
+RESUME_OVERRIDES = {"output", "ui", "color", "api_key_env", "timeout", "max_server_context", "stage_timeout",
+                    "first_request_retries"}
 
 
 def resume_args(parser, args):
@@ -3699,23 +3722,47 @@ def configure_context(client, override=None):
     return info
 
 
-def first_request(client):
-    """Sends a short chat request to wake a cold server before the first warmup task prefills the history. It logs a
-    failure and lets the run go on."""
+FIRST_REQUEST_SECONDS = 30
+FIRST_REQUEST_RETRY_SECONDS = 60
+
+
+def first_requests(client, lanes, retries):
+    """Sends every lane a short chat request at once, before warmup prefills the histories. Returns why the level
+    cannot start when some lane gets no answer within FIRST_REQUEST_SECONDS on every try, else None. The time and lane
+    make each request unique, so the prefix cache cannot answer it."""
     if not hasattr(client, "ping"):
-        return
+        return None
     control = getattr(client, "control", None)
-    # The socket timeout, client.timeout, fires first. Reaching this deadline would stop the run as overloaded.
-    send = (lambda: control.call(client.ping, 2 * client.timeout, "first request")) if control else client.ping
-    started = time.perf_counter()
-    try:
-        retry_rate_limits(send, client, "the first request")
-    except RunCancelled:
-        raise
-    except Exception as exc:
-        emit(client, f"First request failed ({type(exc).__name__}: {exc}); continuing to warmup")
-        return
-    emit(client, f"First request answered in {time.perf_counter() - started:.2f}s")
+    for attempt in range(retries + 1):
+        stamp = real_time.strftime("%Y-%m-%d %H:%M:%S")
+        outcomes = [None] * lanes
+        def send(lane):
+            started = time.perf_counter()
+            try:
+                client.ping(f"Hi there! It's {stamp} and this is lane {lane + 1} of {lanes}.", FIRST_REQUEST_SECONDS)
+                outcomes[lane] = time.perf_counter() - started
+            except Exception as exc:
+                outcomes[lane] = exc
+        # A request still waiting at FIRST_REQUEST_SECONDS hits its socket timeout, and urllib closes the connection.
+        threads = [threading.Thread(target=send, args=(lane,), daemon=True, name="ripal-first-request")
+                   for lane in range(lanes)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            while thread.is_alive():
+                if control:
+                    control.check()
+                thread.join(.05)
+        failed = [(lane, outcome) for lane, outcome in enumerate(outcomes) if isinstance(outcome, Exception)]
+        if not failed:
+            emit(client, f"Warmup first requests: {lanes} lane(s) answered within {max(outcomes):.2f}s")
+            return None
+        reason = (f"{len(failed)} of {lanes} lanes got no answer to a short first request within {FIRST_REQUEST_SECONDS}s ("
+                  + "; ".join(f"lane {lane + 1}: {type(exc).__name__}: {exc}" for lane, exc in failed) + ")")
+        if attempt == retries:
+            return reason + (f" after {retries} retries" if retries else "")
+        emit(client, f"{reason}; retry {attempt + 1} of {retries} in {FIRST_REQUEST_RETRY_SECONDS}s")
+        pause(control, FIRST_REQUEST_RETRY_SECONDS)
 
 
 def run_benchmark(args, client, config):
@@ -3723,7 +3770,6 @@ def run_benchmark(args, client, config):
     try:
         context_info = configure_context(client, args.context_window)
         emit(client, f"Model context limit: {context_info['limit']:,} tokens ({context_info['source']})")
-        first_request(client)
     except Exception as exc:
         report = {"version": VERSION, "model": args.model, "base_url": args.base_url,
                   **termination_state(client), "config": asdict(config), "context_error": str(exc),
@@ -3771,6 +3817,7 @@ def run_benchmark(args, client, config):
                 continue
             emit(client, f"RIPAL-{lanes}L lane context cap {client.context_window:,} tokens "
                          f"(--max-server-context {args.max_server_context:,} / {lanes})")
+        client.first_request_retries = args.first_request_retries
         workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
         workload = [make_session(workload_config, index) for index in range(lanes)]
         run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
@@ -3805,6 +3852,9 @@ def run_benchmark(args, client, config):
         run["workload_sha256"] = hashlib.sha256(json.dumps(workload, sort_keys=True).encode()).hexdigest()
         if run["has_measurements"] or not stop_requested(client):
             runs.append(run)
+        elif not warm_sessions:
+            # The runs list drops a stopped level without measurements, and without warmup sessions it would vanish.
+            skipped[lanes] = client.control.reason
         points = f"{run['score']:.1f}" if run["score"] is not None else "unavailable"
         emit(client, f"RIPAL-{lanes}L measured={repeat + 1} time={format_duration(run['seconds'])} provisional_load_score={points}")
     summaries = {}
@@ -4183,6 +4233,9 @@ def report_from_telemetry(raw):
     report['unmeasured_lanes'] = [c for c in report['requested_lanes'] if str(c) not in report['summaries']]
     # The level running when the run stopped: the highest one with telemetry.
     running = max(raw['runs'], key=lambda key: int(key.split('=')[-1]), default=None) if stopped else None
+    if stopped and stopped.get('reason') in report['skipped_levels'].values():
+        # The run stopped before the skipped level started, so the last level that ran had finished.
+        running = None
     report['stopped_profiles'] = {key.split('=')[-1]: stopped_profile(profile, int(key.split('=')[-1]), params)
                                   for key, profile in raw['runs'].items()
                                   if stopped and (key == running or key.split('=')[-1] not in report['summaries'])}
