@@ -1012,7 +1012,7 @@ def context_series(report):
                 prompt = request.get("tokens", {}).get("prompt_tokens")
                 if not isinstance(prompt, int):
                     continue
-                if request.get("stage") == "submit_result":
+                if "submit_result" in (request.get("stage"), request.get("called")):
                     submits[request["task"]] = prompt
                 timing = request.get("phase_timing") or {}
                 if (run["lanes"] == 1 and timing.get("fresh_tokens") is not None
@@ -1863,7 +1863,7 @@ def session_diagnostics(raw, transform):
                     pressure.append(f"L{lane['lane']}/T{event['task']}")
                 if all(isinstance(v, (int, float)) for v in (cached, prompt, latency)):
                     previous = {'session': event['session'], 'cached': cached, 'prompt': prompt, 'latency': latency}
-                if not request or request.get('stage') != 'submit_result':
+                if not request or request.get('stage') not in ('submit_result', 'auto'):
                     continue
                 fixture = plans.get((event['session'], event['task']))
                 if not fixture:
