@@ -6,6 +6,15 @@ on their performance running reasoning-independent interactive tasks.
 This performance is based on the model's agentic interactivity and gives you an idea of how "good"
 a model is to work with.
 
+![RealMark result card for glm-5.3-flash with low reasoning effort](examples/realmark-glm-5.3-flash.png)
+
+This card comes from [examples/realmark-glm-5.3-flash.json](examples/realmark-glm-5.3-flash.json).
+To render it again in a terminal:
+
+```bash
+python3 ripal.py --render examples/realmark-glm-5.3-flash.json
+```
+
 ## RIPAL Tests
 
 The RIPAL tests are reasoning-independent, which means they do not measure an agent's general intelligence,
