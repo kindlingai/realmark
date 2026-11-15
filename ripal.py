@@ -335,12 +335,11 @@ class WordMixPlanner:
 def read_stream(response, started, control=None, on_chunk=None):
     message = {"role": "assistant", "content": None}
     calls, result, data = {}, {}, []
-    first = last = None
-    visible_chunks = visible_chars = first_chars = 0
+    visible = []
     finish_reason = None
     done = False
     def consume(payload):
-        nonlocal first, last, visible_chunks, visible_chars, first_chars, finish_reason, done
+        nonlocal finish_reason, done
         if on_chunk:
             on_chunk(payload, time.perf_counter())
         if payload == "[DONE]":
@@ -377,13 +376,7 @@ def read_stream(response, started, control=None, on_chunk=None):
                         generated = True
                         chars += len(fragment)
             if generated:
-                now = time.perf_counter()
-                if first is None:
-                    first = now
-                    first_chars = chars
-                last = now
-                visible_chunks += 1
-                visible_chars += chars
+                visible.append((time.perf_counter(), chars))
             if choice.get("finish_reason") is not None:
                 finish_reason = choice["finish_reason"]
     for raw in response:
@@ -405,18 +398,35 @@ def read_stream(response, started, control=None, on_chunk=None):
     if calls:
         message["tool_calls"] = [calls[index] for index in sorted(calls)]
     result["choices"] = [{"index": 0, "finish_reason": finish_reason, "message": message}]
-    result["_stream_timing"] = {"source": "visible streaming deltas",
-        "first_output_seconds": first - started if first is not None else None,
-        "generation_seconds": last - first if first is not None else None,
-        "visible_chunks": visible_chunks, "visible_chars": visible_chars, "first_chunk_chars": first_chars,
-        "response_seconds": time.perf_counter() - started}
+    result["_stream_timing"] = {**visible_timing(visible, started, "visible streaming deltas"),
+                                "response_seconds": time.perf_counter() - started}
     return result
 
 
-# A server that holds the whole reply and sends it in one burst leaves first-to-last visible chunk near zero, which
-# turns decode into millions of tokens a second. Streams send a few tokens a chunk (the virtual model 32), and no
-# server decodes one stream at thousands of tokens a second, so a multi-token reply in one chunk, more than 64
-# tokens a chunk, or a rate over 5,000 tokens a second counts as buffered: no decode timing.
+# A server streaming token by token spaces its chunks at least a millisecond apart. On a remote GLM-5.3 server, every
+# two visible chunks of 191 replies were over 2 ms apart. Chunks closer than 1 ms came in one network read: a burst.
+BURST_GAP_SECONDS = .001
+
+
+def visible_timing(visible, started, source):
+    """Times decode from the end of the first burst of (time, characters) visible chunks. A proxy that batches the
+    stream delivers the first burst's tokens at once, so counting them in the decode window inflates decode."""
+    if not visible:
+        return {"source": source, "first_output_seconds": None, "generation_seconds": None, "visible_chunks": 0,
+                "visible_chars": 0, "first_burst_chars": 0, "first_burst_chunks": 0, "bursts": 0}
+    gaps = [b - a for (a, _), (b, _) in zip(visible, visible[1:])]
+    head = next((index + 1 for index, gap in enumerate(gaps) if gap >= BURST_GAP_SECONDS), len(visible))
+    return {"source": source, "first_output_seconds": visible[0][0] - started,
+            "generation_seconds": visible[-1][0] - visible[head - 1][0], "visible_chunks": len(visible),
+            "visible_chars": sum(chars for _, chars in visible),
+            "first_burst_chars": sum(chars for _, chars in visible[:head]), "first_burst_chunks": head,
+            "bursts": 1 + sum(gap >= BURST_GAP_SECONDS for gap in gaps)}
+
+
+# A server that holds the whole reply sends it in one burst, so the decode window after that burst is empty.
+# Streams send a few tokens a chunk (the virtual model sends 32), and one stream decodes at most hundreds of tokens
+# a second. A multi-token reply in one chunk, over 64 tokens a chunk, or over 5,000 tokens a second counts as
+# buffered and is left out of decode rates.
 BUFFERED_TOKENS_PER_CHUNK = 64
 BUFFERED_TOKENS_PER_SECOND = 5000
 
@@ -443,12 +453,13 @@ def phase_timing(response, tokens):
 
 
 def decode_tokens(timing, output):
-    """The output tokens that arrived after the first visible chunk, the ones the decode window times. A stream of
-    one token a chunk gives output - 1; a chunky stream gives its share of the visible characters past the first
-    chunk, since the first chunk lands before the window opens."""
+    """Counts the output tokens that arrived after the first burst, the ones the decode window times. A stream of one
+    token a chunk gives output - 1. A chunky or bursty stream gives its share of the visible characters past the first
+    burst, because that burst lands before the window opens."""
     if not output or output <= 1:
         return 0
-    chars, head = timing.get("visible_chars"), timing.get("first_chunk_chars")
+    # runs saved before burst timing kept only the first chunk's characters
+    chars, head = timing.get("visible_chars"), timing.get("first_burst_chars", timing.get("first_chunk_chars"))
     if not chars or head is None:
         return output - 1
     return min(output - 1, output * (chars - head) / chars)
@@ -1162,10 +1173,11 @@ def result_card(report, width=98):
     heading = ("RealMark Partial Results — SERVER OVERWHELMED" if report.get("termination_kind") == "overload" else
                "RealMark Partial Results — INTERRUPTED" if report.get("interrupted") else "RealMark Results")
     temperature = report.get("sampling", {}).get("temperature")
+    # runs saved before the flag existed used forced tool choice
     forced = report.get("sampling", {}).get("forced_tool_choice", True)
     add(f"{heading}  ·  {report['model']}  ·  temperature "
         + (f"{temperature:g}" if isinstance(temperature, (int, float)) else "server default")
-        + ("" if forced else "  ·  tool choice auto"))
+        + ("  ·  tool choice forced" if forced else "  ·  tool choice auto"))
     qualities = [s["edit_quality"] for _, s in summaries if s.get("edit_quality") is not None]
     overall = report.get("geometric_mean_score")
     measured = [s["score"] for _, s in summaries if s.get("score")]
@@ -1239,6 +1251,11 @@ def result_card(report, width=98):
     if buffered:
         for line in textwrap.wrap(f"Decode: {buffered} of {len(timed)} replies arrived in one burst (the server buffers "
                                   "its stream), so they give no decode rate.", width=width - 4):
+            add(line)
+    bursty = sum(1 for t in timed if not t.get("buffered") and (t.get("first_burst_chunks") or 0) > 1)
+    if bursty:
+        for line in textwrap.wrap(f"Decode: {bursty} of {len(timed)} replies arrived in network bursts, so decode is "
+                                  "timed from the end of each reply's first burst.", width=width - 4):
             add(line)
     while body and not body[-1]:
         body.pop()
@@ -1382,8 +1399,12 @@ class ContextBudget:
             try:
                 control = getattr(self.client, "control", None)
                 operation = lambda: self.client.count_prompt_tokens(messages)
-                count = control.call(operation, self.client.timeout, "tokenizer") if control else operation()
-                if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+                count = retry_rate_limits(
+                    lambda: control.call(operation, self.client.timeout, "tokenizer") if control else operation(),
+                    self.client, "warmup tokenizer call", retry=getattr(self.client, "phase", None) == "warmup")
+                # A conversation is never 0 tokens. llama.cpp's /tokenize reads only a "content" field, and answers
+                # a chat body with {"tokens": []}.
+                if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
                     raise ValueError("Invalid token count")
                 self.tokenizer_available = True
                 # A copy by value: a message changed in place then no longer matches the prefix.
@@ -2451,6 +2472,30 @@ def stop_requested(client):
     return control is not None and control.stopped
 
 
+RATE_LIMIT_WAIT_SECONDS = 10
+
+
+def is_rate_limit(exc):
+    return isinstance(exc, HTTPError) and exc.code == 429
+
+
+def retry_rate_limits(operation, client, label, retry=True):
+    """Runs operation, and while retry is set, waits out each HTTP 429 and runs it again. Ctrl-C still stops."""
+    control = getattr(client, "control", None)
+    while True:
+        try:
+            return operation()
+        except HTTPError as exc:
+            if not retry or not is_rate_limit(exc):
+                raise
+        emit(client, f"HTTP 429 during {label}; retrying in {RATE_LIMIT_WAIT_SECONDS}s (warmup is unscored)")
+        until = real_time.monotonic() + RATE_LIMIT_WAIT_SECONDS
+        while (left := until - real_time.monotonic()) > 0:
+            if control:
+                control.check()
+            real_time.sleep(min(.25, left))
+
+
 def termination_state(client):
     control = getattr(client, "control", None)
     stopped = control is not None and control.stopped
@@ -2507,7 +2552,7 @@ class Client:
         self.url = base_url.rstrip("/") + "/chat/completions"
         self.model, self.api_key, self.timeout = model, api_key, timeout
         self.extra = extra or {}
-        self.forced_tool_choice = True
+        self.forced_tool_choice = False
         self.cache_policy = cache_policy
         self.streaming = streaming
         protected = {"model", "messages", "tools", "tool_choice", "stream", "n"}
@@ -2532,6 +2577,11 @@ class Client:
             if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
                 return {"limit": limit, "source": f"/models {field}"}
         raise ValueError("Model metadata has no context limit; supply --context-window")
+
+    def ping(self):
+        extra = {k: v for k, v in self.extra.items() if k != "max_completion_tokens"}
+        return self.json_request(self.url, {**extra, "model": self.model, "max_tokens": 16, "stream": False,
+                                            "messages": [{"role": "user", "content": "Hi there!"}]})
 
     def count_prompt_tokens(self, messages):
         root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
@@ -2604,7 +2654,7 @@ def run_session(client, config, tasks, session, state=None):
     budget = state.get("budget") or ContextBudget(client, TOOLS, output_reserve)
     budget.client = client
     gate = getattr(client, "task_gate", None)
-    auto = not getattr(client, "forced_tool_choice", True)
+    auto = not getattr(client, "forced_tool_choice", False)
     compact_before = False
     try:
         if state.get("context_reason"):
@@ -2694,7 +2744,9 @@ def run_session(client, config, tasks, session, state=None):
                         call_config = replace(task_config, deadline=deadline)
                         operation = (lambda: client.complete(messages, stage, call_config, on_chunk=chunk_event)) if getattr(
                             client, "supports_telemetry", False) else (lambda: client.complete(messages, stage, call_config))
-                        response = control.call(operation, deadline, stage) if control else operation()
+                        response = retry_rate_limits(
+                            lambda: control.call(operation, deadline, stage) if control else operation(),
+                            client, f"warmup {stage}", retry=phase == "warmup")
                         received = True
                         trace.emit(sid, phase, "response", task=index + 1, request_id=request_id, body={k: v for k, v in response.items() if k != "_stream_timing"})
                         entry["tokens"] = request_tokens(response, getattr(client, "cache_policy", "server-default"))
@@ -3358,9 +3410,9 @@ def main():
     parser.add_argument("--strict", action="store_true", help="Stop sessions on validation failure; suppress unverified scores")
     parser.add_argument("--timeout", type=float, default=60,
                         help="Initial response deadline (default 60s); later profiles use 4x the previous concurrency maximum")
-    parser.add_argument("--forced-tool-choice", type=boolean, default=True, metavar="BOOL",
-                        help="true (default): each request names the tool to call; false: tool_choice auto, so the "
-                             "model picks the tool and may think first")
+    parser.add_argument("--forced-tool-choice", type=boolean, default=False, metavar="BOOL",
+                        help="false (default): tool_choice auto, so the model picks the tool and may think first; "
+                             "true: each request names the tool to call")
     parser.add_argument("--no-think-prompt", type=boolean, default=True, metavar="BOOL",
                         help=f"true (default): add to the system prompt {NO_THINK_PROMPT!r}")
     parser.add_argument("--temperature", type=float,
@@ -3600,13 +3652,11 @@ def configure_context(client, override=None):
     control = getattr(client, "control", None)
     try:
         operation = client.discover_context_limit
-        info = control.call(operation, client.timeout, "model metadata") if control else operation()
+        info = retry_rate_limits(lambda: control.call(operation, client.timeout, "model metadata") if control
+                                 else operation(), client, "the model metadata request")
     except RunCancelled:
         raise
     except Exception as exc:
-        if isinstance(exc, HTTPError) and exc.code == 429 and control:
-            control.terminate("overload", "HTTP 429 while reading model context metadata")
-            raise RunCancelled(control.reason)
         if override is None:
             raise ValueError(f"Cannot read model context limit: {exc}. Supply --context-window.") from exc
         info = {"limit": override, "source": "--context-window override"}
@@ -3616,11 +3666,31 @@ def configure_context(client, override=None):
     return info
 
 
+def first_request(client):
+    """Sends a short chat request to wake a cold server before the first warmup task prefills the history. It logs a
+    failure and lets the run go on."""
+    if not hasattr(client, "ping"):
+        return
+    control = getattr(client, "control", None)
+    # The socket timeout, client.timeout, fires first. Reaching this deadline would stop the run as overloaded.
+    send = (lambda: control.call(client.ping, 2 * client.timeout, "first request")) if control else client.ping
+    started = time.perf_counter()
+    try:
+        retry_rate_limits(send, client, "the first request")
+    except RunCancelled:
+        raise
+    except Exception as exc:
+        emit(client, f"First request failed ({type(exc).__name__}: {exc}); continuing to warmup")
+        return
+    emit(client, f"First request answered in {time.perf_counter() - started:.2f}s")
+
+
 def run_benchmark(args, client, config):
     requested_config = config
     try:
         context_info = configure_context(client, args.context_window)
         emit(client, f"Model context limit: {context_info['limit']:,} tokens ({context_info['source']})")
+        first_request(client)
     except Exception as exc:
         report = {"version": VERSION, "model": args.model, "base_url": args.base_url,
                   **termination_state(client), "config": asdict(config), "context_error": str(exc),
@@ -3778,8 +3848,7 @@ def refresh_report_charts(report):
 
 
 def timing_from_events(events, request):
-    first = last = None
-    visible_chunks = visible_chars = first_chars = 0
+    visible = []
     for event in events:
         if event['type'] != 'stream_chunk' or event.get('request_id') != request['request_id'] or event['data'] == '[DONE]':
             continue
@@ -3792,14 +3861,8 @@ def timing_from_events(events, request):
                 function = call.get('function') or {}
                 chars += len(function.get('name') or '') + len(function.get('arguments') or '')
         if chars:
-            if first is None:
-                first, first_chars = event['elapsed'], chars
-            last = event['elapsed']
-            visible_chunks += 1
-            visible_chars += chars
-    return {'source': 'raw stream timestamps', 'first_output_seconds': first - request['elapsed'] if first is not None else None,
-            'generation_seconds': last - first if first is not None else None, 'visible_chunks': visible_chunks,
-            'visible_chars': visible_chars, 'first_chunk_chars': first_chars}
+            visible.append((event['elapsed'], chars))
+    return visible_timing(visible, request['elapsed'], 'raw stream timestamps')
 
 
 def session_from_events(events, lane, cache_policy):
