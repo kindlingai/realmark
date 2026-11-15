@@ -4,13 +4,17 @@ Realmark gives you a RIPAL (Reasoning Independent Pseudo Agentic Load) score for
 on their performance running reasoning-independent interactive tasks.
 
 This performance is based on the model's agentic interactivity and gives you an idea of how "good"
-a model is to work with
+a model is to work with.
 
 ## RIPAL Tests
 
 The RIPAL tests are reasoning-independent, which means they do not measure an agent's general intelligence,
 only its ability to perform basic non-copying transformations and "needle-like" lookups. This does
 not count 
+
+**NOTE**: Realmark runs in your server's default thinking mode and in some cases, this default thinking
+mode may be excessive for simpler tasks. Setting a forced tool choice, or `low`, `none` or `0` for thinking level may
+help if the model overthinks these tasks.
 
 Tasks include:
 
