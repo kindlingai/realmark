@@ -62,6 +62,10 @@ class ToolDeadlineExceeded(TimeoutError):
     pass
 
 
+class MaxTokensReached(RunCancelled):
+    pass
+
+
 class RunControl:
     def __init__(self):
         self.stop = threading.Event()
@@ -1171,13 +1175,22 @@ def result_card(report, width=98):
     def add(text=""):
         body.append(safe_text(text)[:width - 4])
     heading = ("RealMark Partial Results — SERVER OVERWHELMED" if report.get("termination_kind") == "overload" else
-               "RealMark Partial Results — INTERRUPTED" if report.get("interrupted") else "RealMark Results")
+               "RealMark Partial Results — INTERRUPTED" if report.get("interrupted") else
+               "RealMark Partial Results — STOPPED" if report.get("terminated") else "RealMark Results")
     temperature = report.get("sampling", {}).get("temperature")
     # runs saved before the flag existed used forced tool choice
     forced = report.get("sampling", {}).get("forced_tool_choice", True)
-    add(f"{heading}  ·  {report['model']}  ·  temperature "
-        + (f"{temperature:g}" if isinstance(temperature, (int, float)) else "server default")
-        + ("  ·  tool choice forced" if forced else "  ·  tool choice auto"))
+    line, *parts = [heading, report["model"],
+                    "temperature " + (f"{temperature:g}" if isinstance(temperature, (int, float)) else "server default"),
+                    "tool choice " + ("forced" if forced else "auto")]
+    # The title wraps between its parts.
+    for part in parts:
+        if len(line) + len(part) + 5 > width - 4:
+            add(line)
+            line = "  " + part
+        else:
+            line += "  ·  " + part
+    add(line)
     qualities = [s["edit_quality"] for _, s in summaries if s.get("edit_quality") is not None]
     overall = report.get("geometric_mean_score")
     measured = [s["score"] for _, s in summaries if s.get("score")]
@@ -1194,7 +1207,8 @@ def result_card(report, width=98):
         add(f"RIPAL Score: {overall:,.1f}" + (f"  {letter}" if letter else "") + partial)
     if report.get("terminated") or report.get("interrupted"):
         if report.get("termination_reason"):
-            add("Stopped: " + report["termination_reason"])
+            for line in textwrap.wrap("Stopped: " + report["termination_reason"], width=width - 4, subsequent_indent="  "):
+                add(line)
         sessions = [r["session"] for r in report.get("calibration", {}).get("rounds", [])]
         sessions += [s for r in report.get("warmup_runs", []) + report.get("runs", [])
                      for s in r["sessions"] + r.get("filler_sessions", [])]
@@ -2496,6 +2510,21 @@ def retry_rate_limits(operation, client, label, retry=True):
             real_time.sleep(min(.25, left))
 
 
+def max_tokens_reason(stage, response, extra, max_tokens, auto):
+    """Says which reply reached max_tokens and what to change. Later replies would likely reach the same limit, so
+    the run stops."""
+    limit = extra.get("max_completion_tokens", extra.get("max_tokens", max_tokens))
+    usage = response.get("usage") or {}
+    thinking = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    output = usage.get("completion_tokens")
+    spent = (f" ({thinking:,} of {output:,} tokens were thinking)"
+             if isinstance(thinking, int) and isinstance(output, int) and thinking else "")
+    template = """--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'"""
+    fix = (f"Rerun with --forced-tool-choice true, or lower the thinking level in the chat template, e.g. {template}."
+           if auto else f"Rerun with a lower thinking level in the chat template, e.g. {template}, or a higher --max-tokens.")
+    return f"The {stage} reply reached max_tokens ({limit:,}){spent}. {fix}"
+
+
 def termination_state(client):
     control = getattr(client, "control", None)
     stopped = control is not None and control.stopped
@@ -2769,7 +2798,13 @@ def run_session(client, config, tasks, session, state=None):
                         if len(tool_calls) == 1 and tool_calls[0].get("id"):
                             call = tool_calls[0]
                         if choice.get("finish_reason") == "length":
-                            raise ValueError("generation reached max_tokens")
+                            if control is None:
+                                control = RunControl()
+                                client.control = control
+                            control.terminate("max_tokens", max_tokens_reason(stage, response, getattr(client, "extra", {}),
+                                                                             task_config.max_tokens, auto))
+                            emit(client, "STOP " + control.reason)
+                            raise MaxTokensReached(control.reason)
                         if auto:
                             outcome = auto_call({**task, "read_padding": padding}, message)
                             issue, auto_reply, entry["called"] = outcome["issue"], outcome["reply"], outcome["name"]
@@ -2777,8 +2812,6 @@ def run_session(client, config, tasks, session, state=None):
                                 submitted = entry["submitted"] = True
                                 quality_credit, transform_score = outcome["credit"], outcome["transform"]
                         else:
-                            if choice.get("finish_reason") == "length":
-                                raise ValueError("generation reached max_tokens")
                             if message.get("content") and str(message["content"]).strip():
                                 entry["response_excerpt"] = str(message["content"])[:240]
                                 raise ValueError("expected tool calls only, without explanatory text")
@@ -2805,8 +2838,8 @@ def run_session(client, config, tasks, session, state=None):
                         trace.emit(sid, phase, "request_error", task=index + 1, request_id=request_id,
                                    error={"type": type(exc).__name__, "message": str(exc), "kind": control.kind if control else None})
                         entry["seconds"] = time.perf_counter() - request_started
-                        entry["cancelled"] = True
-                        entry["received_response"] = False
+                        entry["received_response"] = isinstance(exc, MaxTokensReached)
+                        entry["cancelled"] = not entry["received_response"]
                         raise
                     except Exception as exc:
                         trace.emit(sid, phase, "request_error", task=index + 1, request_id=request_id,
@@ -3986,7 +4019,7 @@ def session_from_events(events, lane, cache_policy):
     completed = sum(t['correct'] for t in results)
     time_limited = stop.get('kind') == 'stage_time_limit' and len(results) < planned
     context_limited = stop.get('kind') == 'context_limit' or 'exceeds' in (stop.get('reason') or '') and 'context' in (stop.get('reason') or '')
-    interrupted = stop.get('kind') in ('interrupt', 'overload')
+    interrupted = stop.get('kind') in ('interrupt', 'overload', 'max_tokens')
     return {'session': lane, 'telemetry': events, 'telemetry_session': start['session'],
             'word_mix': word_mix(events, start['session']), 'phase': start['phase'], 'seed': start['params'].get('seed'), 'seconds': max(0, end['elapsed'] - start['elapsed']),
             'planned_tasks': planned, 'attempted_tasks': len(plans), 'completed_tasks': completed,
