@@ -745,8 +745,9 @@ class TerminalUI:
                     return AMBER
                 return MUTED
             colored = []
-            score_span = None
             in_table = in_chart = False
+            # Each border cell resets every attribute, so bold or colour from the text never reaches it.
+            border = f"\x1b[0;{BACKGROUND};{WHITE}m"
             colors = {"title": MUTED, "tick": WARNING, "label": WARNING, "axis": AMBER}
             def paint_chart(content, base):
                 return CHART_TOKEN.sub(lambda m: f"\x1b[0;{BACKGROUND};{colors[m.lastgroup]}m{m.group(0)}"
@@ -754,24 +755,22 @@ class TerminalUI:
             for line in lines:
                 header = line.startswith("│") and all(column in line for column in CARD_COLUMNS)
                 if header:
-                    start = line.index(" Score ")
-                    score_span = (start, start + len(" Score"))
                     in_table = True
                 elif not line.strip("│ "):
                     in_table = in_chart = False
                 if CHART_TITLE.search(line):
                     in_chart = True
                 if line.startswith(("╭", "╰")):
-                    colored.append(f"\x1b[{BACKGROUND};{WHITE}m{line}\x1b[0m")
+                    colored.append(f"{border}{line}\x1b[0m")
                 elif line.startswith("│") and line.endswith("│"):
                     base = MUTED if header else style(line)
                     content = line[1:-1]
-                    if in_table and score_span:
-                        a, b = score_span
-                        content = content[:a] + "\x1b[1m" + content[a:b] + "\x1b[22m" + content[b:]
+                    if in_table:
+                        # The score is the second cell of the header and of each row.
+                        content = re.sub(r"^(\s*\S+\s+)(\S+)", "\\1\x1b[1m\\2\x1b[22m", content)
                     if in_chart:
                         content = paint_chart(content, base)
-                    colored.append(f"\x1b[{BACKGROUND};{WHITE}m│\x1b[{base}m{content}\x1b[{WHITE}m│\x1b[0m")
+                    colored.append(f"{border}│\x1b[0;{BACKGROUND};{base}m{content}{border}│\x1b[0m")
                 else:
                     # Footnotes below the box keep the terminal's own background.
                     colored.append(f"\x1b[{MUTED}m{line}\x1b[0m")
