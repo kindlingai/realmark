@@ -417,11 +417,11 @@ def visible_timing(visible, started, source):
     """Times decode from the end of the first burst of (time, characters) visible chunks. A proxy that batches the
     stream delivers the first burst's tokens at once, so counting them in the decode window inflates decode."""
     if not visible:
-        return {"source": source, "first_output_seconds": None, "generation_seconds": None, "visible_chunks": 0,
-                "visible_chars": 0, "first_burst_chars": 0, "first_burst_chunks": 0, "bursts": 0}
+        return {"source": source, "first_output_seconds": None, "last_output_seconds": None, "generation_seconds": None,
+                "visible_chunks": 0, "visible_chars": 0, "first_burst_chars": 0, "first_burst_chunks": 0, "bursts": 0}
     gaps = [b - a for (a, _), (b, _) in zip(visible, visible[1:])]
     head = next((index + 1 for index, gap in enumerate(gaps) if gap >= BURST_GAP_SECONDS), len(visible))
-    return {"source": source, "first_output_seconds": visible[0][0] - started,
+    return {"source": source, "first_output_seconds": visible[0][0] - started, "last_output_seconds": visible[-1][0] - started,
             "generation_seconds": visible[-1][0] - visible[head - 1][0], "visible_chunks": len(visible),
             "visible_chars": sum(chars for _, chars in visible),
             "first_burst_chars": sum(chars for _, chars in visible[:head]), "first_burst_chunks": head,
@@ -446,26 +446,28 @@ def stream_buffered(timing, output_tokens):
 
 
 def server_timing(response, tokens):
-    """The server's own prefill and decode seconds and tokens for one reply, or None if it reports none."""
+    """The server's own prefill seconds, total seconds and token counts for one reply, or None if it reports none."""
     def number(value):
         return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
     llama = response.get("timings")
     if isinstance(llama, dict) and all(number(llama.get(k)) for k in ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")):
-        return {"source": "llama.cpp timings", "prefill_tokens": llama["prompt_n"], "prefill_seconds": llama["prompt_ms"] / 1000,
-                "decode_tokens": llama["predicted_n"], "generation_seconds": llama["predicted_ms"] / 1000}
+        return {"source": "llama.cpp timings", "prefill_tokens": llama["prompt_n"], "decode_tokens": llama["predicted_n"],
+                "server_prefill_seconds": llama["prompt_ms"] / 1000,
+                "server_seconds": (llama["prompt_ms"] + llama["predicted_ms"]) / 1000}
     # TensorFold's "seconds" spans prefill and decode.
     tensorfold = response.get("tensorfold")
-    if (isinstance(tensorfold, dict) and number(tensorfold.get("prefill_seconds")) and number(tensorfold.get("seconds"))
-            and tensorfold["seconds"] >= tensorfold["prefill_seconds"]):
+    if isinstance(tensorfold, dict) and number(tensorfold.get("prefill_seconds")) and number(tensorfold.get("seconds")):
         return {"source": "TensorFold timings", "prefill_tokens": tokens.get("fresh_tokens"),
-                "prefill_seconds": tensorfold["prefill_seconds"], "decode_tokens": tokens.get("output_tokens"),
-                "generation_seconds": tensorfold["seconds"] - tensorfold["prefill_seconds"]}
+                "decode_tokens": tokens.get("output_tokens"), "server_prefill_seconds": tensorfold["prefill_seconds"],
+                "server_seconds": tensorfold["seconds"]}
     return None
 
 
 def phase_timing(response, tokens):
     """Client stream timings for a streamed reply. A buffered or non-streamed reply's first output arrives after its
-    decode, so its prefill and decode come from the server's own timings, or stay None without them."""
+    decode. Its client-measured time splits into prefill and decode by the server's prefill share of its own time, or
+    gives neither without server timings. The server's seconds set only the share, so a server that times in other
+    units or leaves out part of the work cannot skew the rates."""
     streamed = response.get("_stream_timing")
     output = tokens.get("output_tokens")
     server = server_timing(response, tokens)
@@ -476,9 +478,16 @@ def phase_timing(response, tokens):
               "prefill_tokens": tokens.get("fresh_tokens"), "prefill_seconds": timing.get("first_output_seconds"),
               "decode_tokens": decode_tokens(timing, output)}
     if not streamed or stream_buffered(timing, output):
-        sample.update(buffered=bool(streamed), prefill_seconds=None, generation_seconds=None)
+        sample.update(streamed=bool(streamed), buffered=bool(streamed), prefill_seconds=None, generation_seconds=None)
         if server:
-            sample.update(server, server_timing=True)
+            seconds = timing.get("last_output_seconds") if streamed else response.get("_response_seconds")
+            prefill, total = server["server_prefill_seconds"], server["server_seconds"]
+            # A reply's server time must fit inside its client time.
+            if seconds and 0 < total <= seconds and prefill <= total:
+                sample.update(server, server_timing=True, prefill_seconds=seconds * prefill / total,
+                              generation_seconds=seconds * (total - prefill) / total)
+            elif seconds:
+                sample.update(source=server["source"], server_timing_rejected=True)
     return sample
 
 
@@ -558,9 +567,9 @@ def average_phases(sessions, lanes=1):
         "average_tool_seconds": sum(r["seconds"] for r in completed) / len(completed) if completed else None,
         "average_completion_seconds": sum(s["seconds"] for s in sessions) / len(sessions) if sessions else None,
         "prefill_caveat": "fresh tokens / time to first visible generation, including queue/network delay; "
-                          "server-reported prefill time where the reply was buffered or not streamed",
+                          "the server's prefill share of the measured reply time where the reply was buffered or not streamed",
         "decode_caveat": "(output tokens - 1) / first-to-last visible generation interval; chunk buffering affects "
-                         "estimates; server-reported decode time where the reply was buffered or not streamed"}
+                         "estimates; the server's decode share of the measured reply time where the reply was buffered or not streamed"}
 
 
 BACKGROUND = "48;2;28;25;23"
@@ -1305,25 +1314,26 @@ def result_card(report, width=98):
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
     timed = [(r.get("phase_timing") or {}) for run in report.get("runs", []) for s in run["sessions"]
              for r in s.get("requests", []) if r.get("phase_timing")]
-    buffered = [t for t in timed if t.get("buffered")]
-    unstreamed = [t for t in timed if t.get("server_timing") and not t.get("buffered")]
-    sources = ", ".join(sorted({t["source"] for t in buffered + unstreamed if t.get("server_timing")}))
-    served = sum(1 for t in buffered if t.get("server_timing"))
-    if buffered:
-        text = (f"Buffered stream: {len(buffered)} of {len(timed)} replies arrived in one burst, so their first output "
-                "came after their decode. ")
-        if served == len(buffered):
-            text += f"Their prefill and decode come from the server's {sources}."
-        elif served:
-            text += f"{served} use the server's {sources}. The rest give no prefill or decode rate."
-        else:
-            text += "They give no prefill or decode rate."
+    def split_note(label, group, how):
+        served = [t for t in group if t.get("server_timing")]
+        rejected = sum(1 for t in group if t.get("server_timing_rejected"))
+        sources = ", ".join(sorted({t["source"] for t in served}))
+        text = f"{label}: {len(group)} of {len(timed)} replies {how}, so their first output came after their decode."
+        if served:
+            whose = "each reply's" if len(served) == len(group) else f"{len(served)} replies'"
+            text += f" The server's {sources} split {whose} measured time into prefill and decode."
+        if rejected:
+            text += f" {rejected} reported more time than the client measured, so the card ignores their server timings."
+        if len(served) < len(group):
+            text += f" {'The rest give' if served else 'They give'} no prefill or decode rate."
         for line in textwrap.wrap(text, width=width - 4):
             add(line)
+    buffered = [t for t in timed if t.get("buffered")]
+    unstreamed = [t for t in timed if t.get("streamed") is False]
+    if buffered:
+        split_note("Buffered stream", buffered, "arrived in one burst")
     if unstreamed:
-        for line in textwrap.wrap(f"Server timings: {len(unstreamed)} of {len(timed)} replies were not streamed, so "
-                                  f"their prefill and decode come from the server's {sources}.", width=width - 4):
-            add(line)
+        split_note("Not streamed", unstreamed, "came as one response")
     bursty = sum(1 for t in timed if not t.get("buffered") and (t.get("first_burst_chunks") or 0) > 1)
     if bursty:
         for line in textwrap.wrap(f"Decode: {bursty} of {len(timed)} replies arrived in network bursts, so decode is "
@@ -2720,7 +2730,9 @@ class Client:
             with control.watch_response(response) if control else nullcontext():
                 if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
                     return read_stream(response, started, control, on_chunk)
-                return json.load(response)
+                body = json.load(response)
+                body["_response_seconds"] = time.perf_counter() - started
+                return body
 
 
 def run_session(client, config, tasks, session, state=None):
@@ -4015,9 +4027,9 @@ def timing_from_events(events, request):
     return visible_timing(visible, request['elapsed'], 'raw stream timestamps')
 
 
-def saved_phase_timing(chunks, request, body, cache_policy):
-    # Older runs kept server timings only in their raw chunks.
-    fields = {}
+def saved_phase_timing(chunks, request, response, body, cache_policy):
+    # Older runs kept server timings only in their raw chunks, and non-streamed replies' times only in their events.
+    fields = {'_response_seconds': response['elapsed'] - request['elapsed']} if response and not chunks else {}
     for event in chunks:
         if event['data'] != '[DONE]':
             fields.update((k, v) for k, v in json.loads(event['data']).items() if k not in ('choices', 'object') and v is not None)
@@ -4056,7 +4068,7 @@ def session_from_events(events, lane, cache_policy):
                  'padding_words': len(plan['padding'].split()), 'source_words': fixture['words'],
                  'transformation': fixture['transformation'], 'seconds': max(0, finish['elapsed'] - event['elapsed']),
                  'received_response': response_event is not None, 'tokens': request_tokens(body, cache_policy),
-                 'phase_timing': saved_phase_timing(streams.get(event['request_id'], []), event, body, cache_policy), 'valid': False,
+                 'phase_timing': saved_phase_timing(streams.get(event['request_id'], []), event, response_event, body, cache_policy), 'valid': False,
                  'generated_words': 0, 'usage': {}}
         for key, value in (body.get('usage') or {}).items():
             if isinstance(value, (int, float)):
