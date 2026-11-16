@@ -27,10 +27,20 @@ help if the model overthinks these tasks.
 
 Tasks include:
 
- - Pig Latin
+ - Letter transposition (like "pig latin")
  - Word reversing
  - Vowel removal (`aeiou`), and
  - Case inversion (e.g. `Hello` -> `hELLO`)
+
+### A Note on Tests
+
+"_Pig Latin??_ that's not something I use in my coding agent!"
+
+That's true. Realmark is designed to be reasoning independent and tests the quality of your models'
+weight and quantization. There are many benchmarks designed to test coding ability and completion of
+reasoning-dependent tests. Realmark focuses on the important basics: agentic ability to manipulate
+tokens at a _word level_ (which is surprisingly difficult - see the _how many r's in strawberry_ test)
+and its baseline turnaround timing for interactive turns.
 
 ## RIPAL Score
 
