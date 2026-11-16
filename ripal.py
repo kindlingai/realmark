@@ -2178,9 +2178,9 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v15"
-# Seeds task generation. v14 changed only sampling, so its tasks are v13's.
-WORKLOAD_VERSION = "ripal-v13"
+VERSION = "ripal-v16"
+# Seeds task generation. v16 balances the target record's position (target_position), so its tasks differ from v13's.
+WORKLOAD_VERSION = "ripal-v16"
 # Protocols that sent temperature 0 in every request without recording it.
 OLD_TEMPERATURE_ZERO = {"ripal-v11", "ripal-v12", "ripal-v13"}
 TARGET_RATIO = 2.0
@@ -2364,13 +2364,24 @@ def mixed_case(word, rng):
     return "".join(char.upper() if index % 2 == 0 else char for index, char in enumerate(word))
 
 
+def target_position(config, session, index, kind):
+    """The target record's index in task `index`'s file. Every block of config.records tasks puts the target at each
+    position once, in a seeded order, and lane `session` adds its number to every position, so lanes running the same
+    task step see different positions. Models copy the record nearest the end of a file more often than the one with
+    the requested ID, so a free draw can give a lane a long run of one position."""
+    block, slot = divmod(index, config.records)
+    order = list(range(config.records))
+    random.Random(f"{WORKLOAD_VERSION}:{config.seed}:{kind}:{block}:positions").shuffle(order)
+    return (order[slot] + session) % config.records
+
+
 def resize_task(task, config, words):
     transformation = task["transformation"]
     vocabulary = PIG_LATIN_WORDS if transformation == "pig_latin" else WORDS
     metadata = random.Random(task["record_seed"] + ":metadata")
     metadata_records = [(f"record-{metadata.getrandbits(64):016x}", metadata.randrange(1, 1000))
                         for _ in range(config.records)]
-    target_index = metadata.randrange(config.records)
+    target_index = task["target_index"]
     records = []
     for index, (record_id, revision) in enumerate(metadata_records):
         rng = random.Random(task["record_seed"] + f":payload:{index}")
@@ -2391,6 +2402,7 @@ def make_session(config, session, task_offset=0):
         task = {"record_seed": f"{WORKLOAD_VERSION}:{config.seed}:{session}:{task_index}:records",
                 "path": f"/workspace/session-{session}/file-{task_index}.jsonl",
                 "transformation": transformation, "instructions": TRANSFORMATIONS[transformation],
+                "target_index": target_position(config, session, task_offset + task_index, "task"),
                 "padding_seed": f"{config.seed}:{session}:{task_index}:padding",
                 "read_padding": " ".join(random.Random(f"{config.seed}:{session}:{task_index}:padding").choices(
                     WORDS, k=config.filler_words))}
@@ -2410,7 +2422,8 @@ def history_messages(config, session):
     while total < config.history_words:
         transformation = TRANSFORMATION_CYCLE[index % len(TRANSFORMATION_CYCLE)]
         task = resize_task({"record_seed": f"{WORKLOAD_VERSION}:{config.seed}:{session}:history:{index}:records",
-                            "transformation": transformation}, config, config.words)
+                            "transformation": transformation,
+                            "target_index": target_position(config, session, index, "history")}, config, config.words)
         target = task["target"]
         path = f"/workspace/session-{session}/history-{index}.jsonl"
         expected = [
