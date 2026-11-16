@@ -350,9 +350,10 @@ def read_stream(response, started, control=None, on_chunk=None):
             done = True
             return
         chunk = json.loads(payload)
-        for key in ("id", "model", "created", "usage", "metrics", "timings"):
-            if chunk.get(key) is not None:
-                result[key] = chunk[key]
+        # Keeps every top-level field, so server accounting such as llama.cpp's "timings" reaches the report.
+        for key, value in chunk.items():
+            if key not in ("choices", "object") and value is not None:
+                result[key] = value
         for choice in chunk.get("choices", []):
             if choice.get("index", 0) != 0:
                 continue
@@ -444,16 +445,41 @@ def stream_buffered(timing, output_tokens):
     return seconds is not None and (seconds <= 0 or decode_tokens(timing, output_tokens) / seconds > BUFFERED_TOKENS_PER_SECOND)
 
 
+def server_timing(response, tokens):
+    """The server's own prefill and decode seconds and tokens for one reply, or None if it reports none."""
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    llama = response.get("timings")
+    if isinstance(llama, dict) and all(number(llama.get(k)) for k in ("prompt_n", "prompt_ms", "predicted_n", "predicted_ms")):
+        return {"source": "llama.cpp timings", "prefill_tokens": llama["prompt_n"], "prefill_seconds": llama["prompt_ms"] / 1000,
+                "decode_tokens": llama["predicted_n"], "generation_seconds": llama["predicted_ms"] / 1000}
+    # TensorFold's "seconds" spans prefill and decode.
+    tensorfold = response.get("tensorfold")
+    if (isinstance(tensorfold, dict) and number(tensorfold.get("prefill_seconds")) and number(tensorfold.get("seconds"))
+            and tensorfold["seconds"] >= tensorfold["prefill_seconds"]):
+        return {"source": "TensorFold timings", "prefill_tokens": tokens.get("fresh_tokens"),
+                "prefill_seconds": tensorfold["prefill_seconds"], "decode_tokens": tokens.get("output_tokens"),
+                "generation_seconds": tensorfold["seconds"] - tensorfold["prefill_seconds"]}
+    return None
+
+
 def phase_timing(response, tokens):
-    timing = response.get("_stream_timing")
-    if not timing:
-        return None
-    timing = dict(timing)
+    """Client stream timings for a streamed reply. A buffered or non-streamed reply's first output arrives after its
+    decode, so its prefill and decode come from the server's own timings, or stay None without them."""
+    streamed = response.get("_stream_timing")
     output = tokens.get("output_tokens")
-    if stream_buffered(timing, output):
-        timing.update(generation_seconds=None, buffered=True)
-    return {**timing, "fresh_tokens": tokens.get("fresh_tokens"), "output_tokens": output,
-            "decode_tokens": decode_tokens(timing, output)}
+    server = server_timing(response, tokens)
+    if not streamed and not server:
+        return None
+    timing = dict(streamed or {"source": "non-streamed response"})
+    sample = {**timing, "fresh_tokens": tokens.get("fresh_tokens"), "output_tokens": output,
+              "prefill_tokens": tokens.get("fresh_tokens"), "prefill_seconds": timing.get("first_output_seconds"),
+              "decode_tokens": decode_tokens(timing, output)}
+    if not streamed or stream_buffered(timing, output):
+        sample.update(buffered=bool(streamed), prefill_seconds=None, generation_seconds=None)
+        if server:
+            sample.update(server, server_timing=True)
+    return sample
 
 
 def decode_tokens(timing, output):
@@ -475,13 +501,25 @@ def sample_decode_tokens(sample):
     return tokens if tokens is not None else sample["output_tokens"] - 1
 
 
+def prefill_sample(sample):
+    """(tokens, seconds) of a sample's prefill, or None without a usable one."""
+    # samples saved before prefill_seconds existed timed prefill to the first output
+    tokens = sample.get("prefill_tokens", sample.get("fresh_tokens"))
+    seconds = sample.get("prefill_seconds", sample.get("first_output_seconds"))
+    return (tokens, seconds) if tokens is not None and (seconds or 0) > 0 else None
+
+
+def phase_rate(pairs):
+    return sum(tokens for tokens, _ in pairs) / sum(seconds for _, seconds in pairs) if pairs else None
+
+
 def average_phases(sessions, lanes=1):
     completed = [request for session in sessions for request in session.get("requests", [])
                  if request.get("received_response") and not request.get("cancelled")]
     samples = [r["phase_timing"] for r in completed if r.get("phase_timing")]
-    prefill = [s for s in samples if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
+    prefill = [p for p in map(prefill_sample, samples) if p]
     decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
-    prefill_rate = sum(s["fresh_tokens"] for s in prefill) / sum(s["first_output_seconds"] for s in prefill) if prefill else None
+    prefill_rate = phase_rate(prefill)
     decode_rate = sum(sample_decode_tokens(s) for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
     task_samples = []
     for session in sessions:
@@ -496,10 +534,10 @@ def average_phases(sessions, lanes=1):
         task_samples.extend(grouped.values())
     prefill_values, decode_values = [], []
     for task in task_samples:
-        inputs = [s for s in task if s.get("fresh_tokens") is not None and (s.get("first_output_seconds") or 0) > 0]
+        inputs = [p for p in map(prefill_sample, task) if p]
         outputs = [s for s in task if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
         if inputs:
-            prefill_values.append(sum(s["fresh_tokens"] for s in inputs) / sum(s["first_output_seconds"] for s in inputs))
+            prefill_values.append(phase_rate(inputs))
         if outputs:
             decode_values.append(sum(sample_decode_tokens(s) for s in outputs) / sum(s["generation_seconds"] for s in outputs))
     return {
@@ -509,7 +547,8 @@ def average_phases(sessions, lanes=1):
         "aggregate_decode_stdev": lanes * statistics.stdev(decode_values) if len(decode_values) > 1 else None,
         "stdev_source": "completed task phase rates; requests combined within each task",
         "prefill_stdev_samples": len(prefill_values), "decode_stdev_samples": len(decode_values),
-        "source": "streaming estimates; visible deltas may be buffered",
+        "source": "streaming estimates; buffered or non-streamed replies use server timings when reported",
+        "server_timing_samples": sum(1 for s in samples if s.get("server_timing")),
         "prefill_tokens_per_second": prefill_rate,
         "decode_tokens_per_second": decode_rate,
         "aggregate_prefill_tokens_per_second": lanes * prefill_rate if prefill_rate is not None else None,
@@ -518,8 +557,10 @@ def average_phases(sessions, lanes=1):
         "prefill_samples": len(prefill), "decode_samples": len(decode),
         "average_tool_seconds": sum(r["seconds"] for r in completed) / len(completed) if completed else None,
         "average_completion_seconds": sum(s["seconds"] for s in sessions) / len(sessions) if sessions else None,
-        "prefill_caveat": "fresh tokens / time to first visible generation, including queue/network delay",
-        "decode_caveat": "(output tokens - 1) / first-to-last visible generation interval; chunk buffering affects estimates"}
+        "prefill_caveat": "fresh tokens / time to first visible generation, including queue/network delay; "
+                          "server-reported prefill time where the reply was buffered or not streamed",
+        "decode_caveat": "(output tokens - 1) / first-to-last visible generation interval; chunk buffering affects "
+                         "estimates; server-reported decode time where the reply was buffered or not streamed"}
 
 
 BACKGROUND = "48;2;28;25;23"
@@ -1015,9 +1056,8 @@ def context_series(report):
                 if "submit_result" in (request.get("stage"), request.get("called")):
                     submits[request["task"]] = prompt
                 timing = request.get("phase_timing") or {}
-                if (run["lanes"] == 1 and timing.get("fresh_tokens") is not None
-                        and (timing.get("first_output_seconds") or 0) > 0):
-                    prefill.append((prompt, timing["fresh_tokens"], timing["first_output_seconds"]))
+                if run["lanes"] == 1 and prefill_sample(timing):
+                    prefill.append((prompt, *prefill_sample(timing)))
             for task in session.get("task_results", []):
                 if task["task"] in submits and task.get("load_completed"):
                     transformed = task.get("transform_score")
@@ -1265,10 +1305,24 @@ def result_card(report, width=98):
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
     timed = [(r.get("phase_timing") or {}) for run in report.get("runs", []) for s in run["sessions"]
              for r in s.get("requests", []) if r.get("phase_timing")]
-    buffered = sum(1 for t in timed if t.get("buffered"))
+    buffered = [t for t in timed if t.get("buffered")]
+    unstreamed = [t for t in timed if t.get("server_timing") and not t.get("buffered")]
+    sources = ", ".join(sorted({t["source"] for t in buffered + unstreamed if t.get("server_timing")}))
+    served = sum(1 for t in buffered if t.get("server_timing"))
     if buffered:
-        for line in textwrap.wrap(f"Decode: {buffered} of {len(timed)} replies arrived in one burst (the server buffers "
-                                  "its stream), so they give no decode rate.", width=width - 4):
+        text = (f"Buffered stream: {len(buffered)} of {len(timed)} replies arrived in one burst, so their first output "
+                "came after their decode. ")
+        if served == len(buffered):
+            text += f"Their prefill and decode come from the server's {sources}."
+        elif served:
+            text += f"{served} use the server's {sources}. The rest give no prefill or decode rate."
+        else:
+            text += "They give no prefill or decode rate."
+        for line in textwrap.wrap(text, width=width - 4):
+            add(line)
+    if unstreamed:
+        for line in textwrap.wrap(f"Server timings: {len(unstreamed)} of {len(timed)} replies were not streamed, so "
+                                  f"their prefill and decode come from the server's {sources}.", width=width - 4):
             add(line)
     bursty = sum(1 for t in timed if not t.get("buffered") and (t.get("first_burst_chunks") or 0) > 1)
     if bursty:
@@ -3961,6 +4015,16 @@ def timing_from_events(events, request):
     return visible_timing(visible, request['elapsed'], 'raw stream timestamps')
 
 
+def saved_phase_timing(chunks, request, body, cache_policy):
+    # Older runs kept server timings only in their raw chunks.
+    fields = {}
+    for event in chunks:
+        if event['data'] != '[DONE]':
+            fields.update((k, v) for k, v in json.loads(event['data']).items() if k not in ('choices', 'object') and v is not None)
+    stream = timing_from_events(chunks, request) if chunks else None
+    return phase_timing({**fields, **body, '_stream_timing': stream}, request_tokens(body, cache_policy))
+
+
 def session_from_events(events, lane, cache_policy):
     events = sorted(events, key=lambda e: (e['time'], int(e['id'].rsplit(':', 1)[-1])))
     start = next(e for e in events if e['type'] == 'session_start')
@@ -3992,7 +4056,7 @@ def session_from_events(events, lane, cache_policy):
                  'padding_words': len(plan['padding'].split()), 'source_words': fixture['words'],
                  'transformation': fixture['transformation'], 'seconds': max(0, finish['elapsed'] - event['elapsed']),
                  'received_response': response_event is not None, 'tokens': request_tokens(body, cache_policy),
-                 'phase_timing': phase_timing({**body, '_stream_timing': timing_from_events(streams.get(event['request_id'], []), event)}, request_tokens(body, cache_policy)), 'valid': False,
+                 'phase_timing': saved_phase_timing(streams.get(event['request_id'], []), event, body, cache_policy), 'valid': False,
                  'generated_words': 0, 'usage': {}}
         for key, value in (body.get('usage') or {}).items():
             if isinstance(value, (int, float)):
