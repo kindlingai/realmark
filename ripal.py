@@ -1618,6 +1618,15 @@ class ContextBudget:
         encoded = json.dumps({"messages": messages, "tools": self.tools}, ensure_ascii=False).encode()
         return len(encoded) + 32 * len(messages) + 128
 
+    def observe(self, messages, usage):
+        """Without a server tokenizer, a response's prompt_tokens is the server's own count of the messages sent."""
+        prompt = (usage or {}).get("prompt_tokens")
+        if self.tokenizer_available is not False or not isinstance(prompt, int) or isinstance(prompt, bool) or prompt <= 0:
+            return
+        # A conversation only grows. A smaller count may leave out cached tokens, so it is not used.
+        if self.counted is None or prompt >= self.counted[1]:
+            self.counted = (json.loads(json.dumps(messages)), prompt)
+
     @staticmethod
     def size_estimate(messages):
         """A conservative token count for messages: their UTF-8 size plus 32 per message."""
@@ -2992,6 +3001,7 @@ def run_session(client, config, tasks, session, state=None):
                                         name = f"{key}.{detail}"
                                         usage[name] = usage.get(name, 0) + count
                                         entry["usage"][name] = count
+                        budget.observe(messages, response.get("usage"))
                         choice = response["choices"][0]
                         message = choice["message"]
                         entry["generated_words"] = generated_words(message)
