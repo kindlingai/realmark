@@ -93,6 +93,18 @@ fits every C=1 request, warmup and measured (one lane, so no queueing): the seco
 a rate, and the seconds a request pays at any size, with its 95% interval. The fixed cost is never below zero. The fit
 is used when its slope passes a two-sided t test at p < 0.05.
 
+A request delayed by a queue or a busy server takes longer whatever its size, and a few of them can decide a
+least-squares slope. The fit leaves out a request that sits more than 3 robust standard deviations above its line,
+and at least 0.25 s and a quarter of its predicted time above it. Then the fit runs again, until no such request is
+left. The card counts the requests left out as stalled. The quarter keeps a server whose prefill slows smoothly with
+context from being read as stalling.
+
+Measured tasks add similar amounts of fresh input, too narrow a range to separate the two costs on a fast server. So
+the warmup tasks after the first are prefill probes: each adds fresh filler to its read result, in sizes that grow 4x
+a step, from half the seeded history's word budget. The history shrinks by the same amount, so measured tasks run at
+the same context. With 4 warmup tasks (the default) and a 40,000-word history, the probes add about 950, 3,800 and
+15,200 words. The filler is drawn fresh each run, so no earlier run's prefix cache holds it.
+
 The Fixed (s) column is each level's fixed cost: the fit's, or that level's median (prefill seconds less fresh tokens at
 the fit's rate) where that is smaller, since some servers spend less a request under load. The prefill column and the
 prefill charts leave it out. Without a fit, the column shows a dash and the prefill rates include it.

@@ -587,6 +587,35 @@ def prefill_fit(pairs):
             "r2": 1 - sse / syy if syy > 0 else None, "p": p, "fixed_held_at_zero": held}
 
 
+# A stall only adds time. A request is left out of the fit when it sits this many robust standard deviations above
+# the line, and at least STALL_FLOOR_SECONDS and STALL_SHARE of its predicted time above it. The share keeps out a
+# server whose prefill slows smoothly with context.
+STALL_SIGMAS = 3
+STALL_FLOOR_SECONDS = .25
+STALL_SHARE = .25
+
+
+def robust_prefill_fit(pairs):
+    """prefill_fit after leaving out stalls: requests far above the fitted line, refitting until none are left. A
+    queue or a busy server delays a request whatever its size, and a few such delays decide a least-squares slope.
+    "stalls" counts the requests left out."""
+    kept = list(pairs)
+    for _ in range(5):
+        fit = prefill_fit(kept)
+        if not fit:
+            return None
+        predicted = [fit["fixed_seconds"] + tokens / fit["marginal_tokens_per_second"] for tokens, _ in kept]
+        residuals = [seconds - guess for (_, seconds), guess in zip(kept, predicted)]
+        centre = statistics.median(residuals)
+        spread = 1.4826 * statistics.median(abs(r - centre) for r in residuals)
+        below = [pair for pair, residual, guess in zip(kept, residuals, predicted)
+                 if residual <= centre + max(STALL_SIGMAS * spread, STALL_FLOOR_SECONDS, STALL_SHARE * guess)]
+        if len(below) == len(kept):
+            break
+        kept = below
+    return {**fit, "stalls": len(pairs) - len(kept)}
+
+
 def level_fixed_seconds(report, fit):
     """Each level's fixed prefill seconds: the C=1 fit's, or that level's median implied fixed cost (prefill seconds
     less fresh tokens at the fit's rate) where that is smaller, so a level where requests get cheaper under load is
@@ -1267,7 +1296,7 @@ def match_label(quality):
 
 
 def result_card(report, width=98):
-    fit = prefill_fit(solo_prefill_pairs(report))
+    fit = robust_prefill_fit(solo_prefill_pairs(report))
     fit = fit if fit and fit["p"] < PREFILL_FIT_P else None
     fixed = fit["fixed_seconds"] if fit else 0.0
     level_fixed = level_fixed_seconds(report, fit) if fit else {}
@@ -1417,8 +1446,9 @@ def result_card(report, width=98):
         r2 = f", R² {fit['r2']:.2f}" if fit.get("r2") is not None else ""
         p = "p < 0.001" if fit["p"] < 0.001 else f"p {fit['p']:.3f}"
         ci = f" ±{fit['fixed_ci']:.2f}" if fit["fixed_ci"] else ""
+        stalls = f", {fit['stalls']} stalled left out" if fit["stalls"] else ""
         add(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + {fit['fixed_seconds']:.2f}s{ci} a request "
-            f"({fit['samples']} requests{r2}, {p})")
+            f"({fit['samples']} requests{stalls}{r2}, {p})")
         add("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates leave it out.")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
@@ -2364,9 +2394,10 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v16"
+VERSION = "ripal-v17"
 # Seeds task generation. v16 balances the target record's position (target_position), so its tasks differ from v13's.
-WORKLOAD_VERSION = "ripal-v16"
+# v17 moves half the seeded history into warmup prefill probes (probe_words), so v16 runs cannot be resumed.
+WORKLOAD_VERSION = "ripal-v17"
 # Protocols that sent temperature 0 in every request without recording it.
 OLD_TEMPERATURE_ZERO = {"ripal-v11", "ripal-v12", "ripal-v13"}
 TARGET_RATIO = 2.0
@@ -2594,6 +2625,20 @@ def make_session(config, session, task_offset=0):
                     WORDS, k=config.filler_words))}
         tasks.append(resize_task(task, config, config.words))
     return tasks
+
+
+# Warmup prefill probes. The warmup tasks after the first add fresh filler to their read results, in sizes that grow
+# PROBE_GROWTH times a step, so the C=1 prefill fit sees fresh tokens from hundreds to tens of thousands. The probe
+# words come out of the seeded history, so measured tasks run at the same context.
+PROBE_SHARE = .5
+PROBE_GROWTH = 4
+
+
+def probe_words(history_words, warmup_tasks):
+    """Fresh filler words for each warmup task. The first task prefills the history, so it gets none."""
+    weights = [0] + [PROBE_GROWTH ** ((index - 1) % 3) for index in range(1, warmup_tasks)]
+    total, budget = sum(weights), int(history_words * PROBE_SHARE)
+    return [budget * weight // total if total else 0 for weight in weights]
 
 
 def history_messages(config, session):
@@ -2932,6 +2977,10 @@ def run_session(client, config, tasks, session, state=None):
                 mix_control.input_words += sum(weighted_words(m.get("content")) for m in (messages[0], messages[-1]))
             padding_words = mix_control.plan(expected, index + 1)
             padding = " ".join(random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
+            probe = task.get("probe_words", 0)
+            if probe:
+                # The filler is drawn fresh each run, so no earlier run's prefix cache holds it. The word mix leaves it out.
+                padding = " ".join(filter(None, [padding, " ".join(random.Random().choices(WORDS, k=probe))]))
             expected[1][2]["read_padding"] = padding
             task_config = replace(config, words=words, max_tokens=max(config.max_tokens, len(expected_text.encode()) + 256))
             extra = getattr(client, "extra", {})
@@ -2966,6 +3015,8 @@ def run_session(client, config, tasks, session, state=None):
                     if history_prefill and deadline is not None:
                         # The lane's first request prefills the whole history.
                         deadline += state.get("history_deadline_seconds", 0)
+                    if probe and deadline is not None:
+                        deadline += state.get("prefill_seconds_per_word", 0) * probe
                     entry["deadline_seconds"] = deadline
                     calls += 1
                     request_id = f"{sid}:request:{calls}"
@@ -3287,8 +3338,8 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             virtual.enter_lane(index)
         barrier.wait()
         # Lanes prefill their histories together, so each gets a share of the prefill floor.
-        state = {"history_deadline_seconds": HISTORY_TOKENS_PER_WORD * config.history_words * lanes
-                 / (stage_prefill_rate or 1000)}
+        per_word = HISTORY_TOKENS_PER_WORD * lanes / (stage_prefill_rate or 1000)
+        state = {"history_deadline_seconds": per_word * config.history_words, "prefill_seconds_per_word": per_word}
         if warmup_tasks:
             warm_config = replace(config, tasks=warmup_tasks, filler=False)
             warm_client = PhaseClient(stage_client, "warmup")
@@ -3619,8 +3670,9 @@ def main():
                         help="API key environment variable (default OPENAI_API_KEY); never saved in results")
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
     parser.add_argument("--repeats", type=positive, default=1)
-    parser.add_argument("--warmup-tasks", dest="warmup_tasks", type=int, default=2,
-                        help="Unscored tasks at the start of each session (default 2; excluded from measured statistics).")
+    parser.add_argument("--warmup-tasks", dest="warmup_tasks", type=int, default=4,
+                        help="Unscored tasks at the start of each session (default 4; excluded from measured statistics). "
+                             "The tasks after the first carry prefill probes.")
     parser.add_argument("--bootstrap-samples", type=positive, default=5000)
     parser.add_argument("--ratio-tolerance", type=float, default=.15,
                         help="Relative tolerance around the 2:1 visible-word ratio, default ±15%%")
@@ -4020,8 +4072,13 @@ def run_benchmark(args, client, config):
             emit(client, f"RIPAL-{lanes}L lane context cap {client.context_window:,} tokens "
                          f"(--max-server-context {args.max_server_context:,} / {lanes})")
         client.first_request_retries = args.first_request_retries
+        probes = probe_words(batch_config.history_words, args.warmup_tasks)
+        batch_config = replace(batch_config, history_words=batch_config.history_words - sum(probes))
         workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
         workload = [make_session(workload_config, index) for index in range(lanes)]
+        for tasks in workload:
+            for task, words in zip(tasks, probes):
+                task["probe_words"] = words
         run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
                           stage_prefill_rate=args.stage_prefill_rate, stage_timeout=args.stage_timeout)
         run["tool_timeout_seconds"] = deadline
