@@ -522,6 +522,78 @@ def phase_rate(pairs):
     return sum(tokens for tokens, _ in pairs) / sum(seconds for _, seconds in pairs) if pairs else None
 
 
+def regularized_beta(a, b, x):
+    """I_x(a, b), by the continued fraction of Numerical Recipes (betacf), for the t test below."""
+    if x <= 0 or x >= 1:
+        return 0.0 if x <= 0 else 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1 - x))
+    if x > (a + 1) / (a + b + 2):
+        return 1 - regularized_beta(b, a, 1 - x)
+    c, d = 1.0, 1 - (a + b) * x / (a + 1)
+    d = 1 / (d if abs(d) > 1e-300 else 1e-300)
+    h = d
+    for m in range(1, 300):
+        for numerator in (m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+                          -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))):
+            d = 1 + numerator * d
+            d = 1 / (d if abs(d) > 1e-300 else 1e-300)
+            c = 1 + numerator / c
+            c = c if abs(c) > 1e-300 else 1e-300
+            h *= d * c
+        if abs(d * c - 1) < 1e-12:
+            break
+    return front * h / a
+
+
+def t_critical(df, p):
+    """The t a two-sided test at level p needs with df degrees of freedom, by bisection on regularized_beta."""
+    low, high = 0.0, 1e3
+    for _ in range(100):
+        mid = (low + high) / 2
+        if regularized_beta(df / 2, 0.5, df / (df + mid * mid)) > p:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2
+
+
+def prefill_fit(pairs):
+    """Least squares over (fresh tokens, seconds): seconds = fixed + tokens / rate, with fixed held at 0 or above. The
+    rate is what each further fresh token costs and fixed is what a request pays at any size. p is the two-sided t test
+    of the slope, and fixed_ci the half-width of the fixed cost's 95% interval (0 when fixed is held at 0). None with
+    too few requests, no spread in size, or no positive slope."""
+    n = len(pairs)
+    xs, ys = zip(*pairs) if pairs else ((), ())
+    if n < 3 or len(set(xs)) < 2:
+        return None
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    sxx = sum((x - mx) ** 2 for x in xs)
+    slope = sum((x - mx) * (y - my) for x, y in pairs) / sxx
+    fixed, df, spread = my - slope * mx, n - 2, sxx
+    if fixed < 0:
+        # a negative fixed cost has no meaning: fit the line through the origin
+        spread = sum(x * x for x in xs)
+        slope, fixed, df = sum(x * y for x, y in pairs) / spread, 0.0, n - 1
+    if slope <= 0:
+        return None
+    sse = sum((y - fixed - slope * x) ** 2 for x, y in pairs)
+    syy = sum((y - my) ** 2 for y in ys)
+    t = slope / math.sqrt(sse / df / spread) if sse > 0 else math.inf
+    p = regularized_beta(df / 2, 0.5, df / (df + t * t)) if math.isfinite(t) else 0.0
+    held = df == n - 1
+    fixed_ci = 0.0 if held else t_critical(df, 0.05) * math.sqrt(sse / df * (1 / n + mx * mx / sxx))
+    return {"marginal_tokens_per_second": 1 / slope, "fixed_seconds": fixed, "fixed_ci": fixed_ci, "samples": n,
+            "r2": 1 - sse / syy if syy > 0 else None, "p": p, "fixed_held_at_zero": held}
+
+
+def solo_prefill_pairs(report):
+    """(fresh tokens, seconds) of every answered C=1 request, warmup and measured: one lane, so no queueing."""
+    runs = [run for run in report.get("runs", []) + report.get("warmup_runs", []) if run.get("lanes") == 1]
+    return [pair for run in runs for session in run["sessions"] for request in session.get("requests", [])
+            if request.get("received_response") and not request.get("cancelled") and request.get("phase_timing")
+            for pair in [prefill_sample(request["phase_timing"])] if pair]
+
+
 def average_phases(sessions, lanes=1):
     completed = [request for session in sessions for request in session.get("requests", [])
                  if request.get("received_response") and not request.get("cancelled")]
@@ -1309,6 +1381,13 @@ def result_card(report, width=98):
             add(f"C={lanes} time cap: {elapsed:.1f}s observed; {estimate}.")
         if summary.get("context_limited_sessions"):
             add(f"C={lanes} context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
+    fit = prefill_fit(solo_prefill_pairs(report))
+    if fit and fit["p"] < PREFILL_FIT_P:
+        r2 = f", R² {fit['r2']:.2f}" if fit.get("r2") is not None else ""
+        p = "p < 0.001" if fit["p"] < 0.001 else f"p {fit['p']:.3f}"
+        ci = f" ±{fit['fixed_ci']:.2f}" if fit["fixed_ci"] else ""
+        add(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s a fresh token + "
+            f"{fit['fixed_seconds']:.2f}s{ci} a request ({fit['samples']} requests{r2}, {p})")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
@@ -1546,6 +1625,8 @@ class ContextBudget:
 
 
 DEFAULT_TASK_SCHEDULE = [(1, 16), (2, 8), (4, 4)]
+# The card shows the C=1 prefill fit when its slope passes a two-sided t test at this level.
+PREFILL_FIT_P = 0.05
 # GLM-5.3's tokenizer gives 1.63 tokens per weighted word of history. Deadlines assume 2.
 HISTORY_TOKENS_PER_WORD = 2
 DEFAULT_HISTORY_WORDS = 40000

@@ -85,6 +85,15 @@ is penalized half as much as generation time - the penalty is designed to factor
 putting all non-thinking models above all thinking models. $0.5$ was effectively picked as the half-way compromise between
 "thinking should not be penalized" and "thinking should be fully penalized"
 
+### Prefill Fit
+
+The card's prefill column divides each level's fresh tokens by their prefill time. A request that adds a few hundred
+tokens to a long cached history spends most of that time on what the server does for any request, so the column can
+read far below the server's real prefill rate. The card adds a least-squares fit over every C=1 request, warmup and
+measured (one lane, so no queueing): the seconds each further fresh token costs, as a rate, and the seconds a request
+pays at any size, with its 95% interval. The fixed cost is never below zero. The line appears when the slope passes a
+two-sided t test at p < 0.05.
+
 ## Quality Score
 
 Each run also gets a quality score as a letter grade. While the tasks are reasoning-independent, model and quantization quality
