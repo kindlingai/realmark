@@ -87,12 +87,15 @@ putting all non-thinking models above all thinking models. $0.5$ was effectively
 
 ### Prefill Fit
 
-The card's prefill column divides each level's fresh tokens by their prefill time. A request that adds a few hundred
-tokens to a long cached history spends most of that time on what the server does for any request, so the column can
-read far below the server's real prefill rate. The card adds a least-squares fit over every C=1 request, warmup and
-measured (one lane, so no queueing): the seconds each further fresh token costs, as a rate, and the seconds a request
-pays at any size, with its 95% interval. The fixed cost is never below zero. The line appears when the slope passes a
-two-sided t test at p < 0.05.
+A request that adds a few hundred tokens to a long cached history spends most of its prefill time on what the server
+does for any request, so fresh tokens over prefill time can read far below the server's real prefill rate. The card
+fits every C=1 request, warmup and measured (one lane, so no queueing): the seconds each further fresh token costs, as
+a rate, and the seconds a request pays at any size, with its 95% interval. The fixed cost is never below zero. The fit
+is used when its slope passes a two-sided t test at p < 0.05.
+
+The Fixed (s) column is each level's fixed cost: the fit's, or that level's median (prefill seconds less fresh tokens at
+the fit's rate) where that is smaller, since some servers spend less a request under load. The prefill column and the
+prefill charts leave it out. Without a fit, the column shows a dash and the prefill rates include it.
 
 ## Quality Score
 

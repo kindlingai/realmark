@@ -519,7 +519,8 @@ def prefill_sample(sample):
 
 
 def phase_rate(pairs):
-    return sum(tokens for tokens, _ in pairs) / sum(seconds for _, seconds in pairs) if pairs else None
+    seconds = sum(s for _, s in pairs)
+    return sum(tokens for tokens, _ in pairs) / seconds if pairs and seconds > 0 else None
 
 
 def regularized_beta(a, b, x):
@@ -586,6 +587,21 @@ def prefill_fit(pairs):
             "r2": 1 - sse / syy if syy > 0 else None, "p": p, "fixed_held_at_zero": held}
 
 
+def level_fixed_seconds(report, fit):
+    """Each level's fixed prefill seconds: the C=1 fit's, or that level's median implied fixed cost (prefill seconds
+    less fresh tokens at the fit's rate) where that is smaller, so a level where requests get cheaper under load is
+    not over-corrected. Never below zero."""
+    rate, fixed = fit["marginal_tokens_per_second"], fit["fixed_seconds"]
+    levels = {}
+    for run in report.get("runs", []):
+        implied = [seconds - tokens / rate for session in run["sessions"] for request in session.get("requests", [])
+                   if request.get("received_response") and not request.get("cancelled") and request.get("phase_timing")
+                   for tokens, seconds in [prefill_sample(request["phase_timing"]) or (None, None)] if tokens is not None]
+        levels.setdefault(run["lanes"], []).extend(implied)
+    return {lanes: fixed if lanes == 1 or not implied else max(0.0, min(fixed, statistics.median(implied)))
+            for lanes, implied in levels.items()}
+
+
 def solo_prefill_pairs(report):
     """(fresh tokens, seconds) of every answered C=1 request, warmup and measured: one lane, so no queueing."""
     runs = [run for run in report.get("runs", []) + report.get("warmup_runs", []) if run.get("lanes") == 1]
@@ -594,11 +610,13 @@ def solo_prefill_pairs(report):
             for pair in [prefill_sample(request["phase_timing"])] if pair]
 
 
-def average_phases(sessions, lanes=1):
+def average_phases(sessions, lanes=1, fixed=0.0):
+    """Phase rates of a level's answered requests. `fixed` seconds come off every request's prefill time (the C=1
+    prefill fit's fixed cost), so the prefill rate counts only the time each fresh token costs."""
     completed = [request for session in sessions for request in session.get("requests", [])
                  if request.get("received_response") and not request.get("cancelled")]
     samples = [r["phase_timing"] for r in completed if r.get("phase_timing")]
-    prefill = [p for p in map(prefill_sample, samples) if p]
+    prefill = [(tokens, seconds - fixed) for tokens, seconds in filter(None, map(prefill_sample, samples))]
     decode = [s for s in samples if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
     prefill_rate = phase_rate(prefill)
     decode_rate = sum(sample_decode_tokens(s) for s in decode) / sum(s["generation_seconds"] for s in decode) if decode else None
@@ -615,9 +633,9 @@ def average_phases(sessions, lanes=1):
         task_samples.extend(grouped.values())
     prefill_values, decode_values = [], []
     for task in task_samples:
-        inputs = [p for p in map(prefill_sample, task) if p]
+        inputs = [(tokens, seconds - fixed) for tokens, seconds in filter(None, map(prefill_sample, task))]
         outputs = [s for s in task if (s.get("output_tokens") or 0) > 1 and (s.get("generation_seconds") or 0) > 0]
-        if inputs:
+        if inputs and phase_rate(inputs) is not None:
             prefill_values.append(phase_rate(inputs))
         if outputs:
             decode_values.append(sum(sample_decode_tokens(s) for s in outputs) / sum(s["generation_seconds"] for s in outputs))
@@ -1067,8 +1085,8 @@ CHART_TITLE = re.compile(r"[A-Za-z](?:(?!\s{3})[^·│\u2800-\u28ff])*?  ·  Y: 
 # Inside a chart row: a title, a Y tick (a number before its axis), an X label (C=4, 16K), or axis lines.
 CHART_TOKEN = re.compile(r"(?P<title>" + CHART_TITLE.pattern + r")|(?P<tick>\d[\d,.]*(?= [│└]))"
                          r"|(?P<label>\bC=\d+\b|\b\d+(?:\.\d+)?K\b)|(?P<axis>[│└─]+)")
-CARD_COLUMNS = ("C", "Score", "Decode (t/s)", "Prefill (t/s)", "Context (t)", "Done", "Time (s)", "Think",
-                "Match (%)", "Mix (w / t)")
+CARD_COLUMNS = ("C", "Score", "Decode (t/s)", "Prefill (t/s)", "Fixed (s)", "Context (t)", "Done", "Time (s)", "Think",
+                "Match (%)")
 
 
 def context_label(tokens):
@@ -1157,7 +1175,8 @@ def bucket_points(samples, buckets, reduce, bounds=None):
     return [(low + span * (index + .5), reduce(group) if group else None) for index, group in enumerate(groups)], low, high
 
 
-def context_grid(report, width):
+def context_grid(report, width, fixed=0.0):
+    """`fixed` seconds (the C=1 prefill fit's fixed cost) come off every request in the prefill chart."""
     quality, prefill = context_series(report)
     gap = 3
     left_width = (width - gap) // 2
@@ -1203,8 +1222,10 @@ def context_grid(report, width):
                 rows[row_of(statistics.mean(partial))][column] = "x"
     left = chart(quality, lambda group: statistics.mean(t for _, t, _ in group),
                  "Transformation by context (t)", "mean %, x = match", left_width, (0, 100), penalties)
-    right = chart(prefill, lambda group: sum(f for _, f, _ in group) / sum(s for _, _, s in group),
-                  "Prefill by context (t)", "t/s, C=1", right_width)
+    def prefill_rate(group):
+        seconds = sum(s - fixed for _, _, s in group)
+        return sum(f for _, f, _ in group) / seconds if seconds > 0 else None
+    right = chart(prefill, prefill_rate, "Prefill by context (t)", "t/s, C=1", right_width)
     height = max(len(left), len(right))
     left += [""] * (height - len(left))
     right += [""] * (height - len(right))
@@ -1246,7 +1267,19 @@ def match_label(quality):
 
 
 def result_card(report, width=98):
+    fit = prefill_fit(solo_prefill_pairs(report))
+    fit = fit if fit and fit["p"] < PREFILL_FIT_P else None
+    fixed = fit["fixed_seconds"] if fit else 0.0
+    level_fixed = level_fixed_seconds(report, fit) if fit else {}
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
+    if fit:
+        # The card's prefill rates leave out each level's fixed cost; the saved summaries and the score keep it.
+        def without_fixed(lanes, summary):
+            sessions = [s for run in report.get("runs", []) if run["lanes"] == int(lanes) for s in run["sessions"]]
+            cut = level_fixed.get(int(lanes), fixed)
+            phases = {k: v for k, v in average_phases(sessions, int(lanes), cut).items() if "prefill" in k}
+            return {**summary, "phase_averages": {**summary.get("phase_averages", {}), **phases}}
+        summaries = [(lanes, without_fixed(lanes, summary)) for lanes, summary in summaries]
     stopped = report.get("stopped_profiles", {})
     notes = report.get("diagnostics", []) + [
         {"lanes": [int(lanes)], "columns": ["context"],
@@ -1267,30 +1300,29 @@ def result_card(report, width=98):
                        if int(lanes) in note["lanes"] and column in note["columns"])
     rows = []
     for lanes, summary in summaries:
-        mark = {column: markers(lanes, column) for column in ("decode", "prefill", "match", "mix", "time", "context")}
-        ratio = summary["token_mix"].get("fresh_per_output")
-        words = summary.get("word_mix", {}).get("input_per_output")
-        prefix = "~" if summary.get("mix_excludes_cancelled_filler_usage", False) else ""
+        mark = {column: markers(lanes, column)
+                for column in ("score", "decode", "prefill", "fixed", "match", "time", "context")}
+        cut = level_fixed.get(int(lanes))
         estimated = summary.get("time_limited")
         seconds = summary.get("estimated_full_seconds") if estimated else summary.get("mean_seconds")
         planned = summary.get("planned_tasks", 0)
         rows.append([
-            str(lanes), compact_number(summary["score"], 9),
+            str(lanes), compact_number(summary["score"], 9) + mark["score"],
             card_rate(summary, lanes, "decode_tokens_per_second", 14) + mark["decode"],
             card_rate(summary, lanes, "prefill_tokens_per_second", 15) + mark["prefill"],
+            (f"{cut:.2f}" if cut is not None else "—") + mark["fixed"],
             context_cell(summary) + mark["context"],
             f"{summary.get('load_completed_tasks', planned)}/{planned}",
             ("~" if estimated else "") + compact_number(seconds, 9, 2) + mark["time"],
             f"{summary['think_share']:.0%}" if summary.get("think_share") is not None else "—",
-            match_label(summary.get("edit_quality")) + mark["match"],
-            f"{prefix}{compact_number(words, 3)}w/{compact_number(ratio, 3)}t" + mark["mix"]])
+            match_label(summary.get("edit_quality")) + mark["match"]])
     for lanes, info in sorted(stopped.items(), key=lambda item: int(item[0])):
         if lanes in dict(summaries):
             continue
         context = (f"~{context_label(info['context_tokens'])} (~{context_label(info['context_tokens_per_lane'])})"
                    if info["context_tokens"] else "—")
-        rows.append([lanes, "—", "—", "—", context + markers(lanes, "context"),
-                     f"{info['completed_tasks']}/{info['planned_tasks']}", "—", "—", "—", "—"])
+        rows.append([lanes, "—", "—", "—", "—", context + markers(lanes, "context"),
+                     f"{info['completed_tasks']}/{info['planned_tasks']}", "—", "—", "—"])
     rows.sort(key=lambda row: int(row[0]))
     sizes = [max(len(cell) for cell in column) for column in zip(CARD_COLUMNS, *rows)]
     width = max(sum(sizes) + 2 * (len(sizes) - 1) + 4, width)
@@ -1365,7 +1397,7 @@ def result_card(report, width=98):
         for line in chart_grid(summaries, width - 4):
             add(line)
         add()
-        for line in context_grid(report, width - 4):
+        for line in context_grid(report, width - 4, fixed):
             add(line)
     else:
         add("No measured scores available.")
@@ -1381,13 +1413,13 @@ def result_card(report, width=98):
             add(f"C={lanes} time cap: {elapsed:.1f}s observed; {estimate}.")
         if summary.get("context_limited_sessions"):
             add(f"C={lanes} context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
-    fit = prefill_fit(solo_prefill_pairs(report))
-    if fit and fit["p"] < PREFILL_FIT_P:
+    if fit:
         r2 = f", R² {fit['r2']:.2f}" if fit.get("r2") is not None else ""
         p = "p < 0.001" if fit["p"] < 0.001 else f"p {fit['p']:.3f}"
         ci = f" ±{fit['fixed_ci']:.2f}" if fit["fixed_ci"] else ""
-        add(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s a fresh token + "
-            f"{fit['fixed_seconds']:.2f}s{ci} a request ({fit['samples']} requests{r2}, {p})")
+        add(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + {fit['fixed_seconds']:.2f}s{ci} a request "
+            f"({fit['samples']} requests{r2}, {p})")
+        add("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates leave it out.")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
@@ -2061,7 +2093,7 @@ def session_diagnostics(raw, transform):
                 findings['misses'].append((lane['lane'], misses, long_requests))
         if findings['wordmix']:
             details = ', '.join(f'L{lane} {ratio:.2f}:1' for lane, ratio in findings['wordmix'])
-            notes.append({'lanes': [c], 'columns': ['mix'], 'text': f'C={c} planned word mix outside the 2:1 reference ({details}). Fixed overhead or padding prevents the target; use more source words, fewer records, or enable word planning.'})
+            notes.append({'lanes': [c], 'columns': ['score'], 'text': f'C={c} planned word mix outside the 2:1 reference ({details}). Fixed overhead or padding prevents the target; use more source words, fewer records, or enable word planning.'})
         if findings['loop']:
             details = '; '.join(f"{ref}: {loop['words']:,} words repeating a {loop['period']}-word motif" for ref, loop in findings['loop'])
             notes.append({'lanes': [c], 'columns': ['decode'], 'text': f'C={c} looping detected — {details}.'})
@@ -2083,7 +2115,7 @@ def session_diagnostics(raw, transform):
     if len(block_counts) >= 3 and len(set(block_counts)) >= 2:
         granularity = math.gcd(*block_counts)
         if 128 <= granularity <= 65536 and granularity & (granularity - 1) == 0:
-            notes.append({'lanes': sorted(block_lanes), 'columns': ['mix'], 'text': f'Cache hits align to {granularity:,}-token units (inferred). Partial-block tails may be re-prefilled.'})
+            notes.append({'lanes': sorted(block_lanes), 'columns': ['fixed'], 'text': f'Cache hits align to {granularity:,}-token units (inferred). Partial-block tails may be re-prefilled.'})
     return notes
 
 
