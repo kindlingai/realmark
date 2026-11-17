@@ -76,6 +76,15 @@ class RunControl:
     def init_responses(self):
         self.response_lock = threading.Lock()
         self.response_sockets = set()
+        self.misses = Counter()
+
+    def first_miss(self, kind):
+        """Counts a one-off failure of `kind`: a reply that ran on to max_tokens without thinking, or a request past
+        its response deadline. True for the first of its kind under this control, which is a level, since each level
+        has its own StageControl. One such failure fails its task; a second stops the run."""
+        with self.response_lock:
+            self.misses[kind] += 1
+            return self.misses[kind] == 1
 
     @contextmanager
     def watch_response(self, response):
@@ -144,9 +153,8 @@ class RunControl:
             self.check()
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
-                message = f"{label} exceeded the {timeout:g}s response deadline (possible server overload)"
-                self.terminate("overload", message)
-                raise ToolDeadlineExceeded(message)
+                # The caller decides whether one miss stops the run.
+                raise ToolDeadlineExceeded(f"{label} exceeded the {timeout:g}s response deadline")
             try:
                 ok, value = result.get(timeout=min(.05, remaining))
             except queue.Empty:
@@ -587,41 +595,57 @@ def prefill_fit(pairs):
             "r2": 1 - sse / syy if syy > 0 else None, "p": p, "fixed_held_at_zero": held}
 
 
-# A stall only adds time. A request is left out of the fit when it sits this many robust standard deviations above
-# the line, and at least STALL_FLOOR_SECONDS and STALL_SHARE of its predicted time above it. The share keeps out a
-# server whose prefill slows smoothly with context.
-STALL_SIGMAS = 3
-STALL_FLOOR_SECONDS = .25
-STALL_SHARE = .25
+# A queue or a busy server delays a request whatever its size, and on a shared endpoint most requests wait. A delay
+# only adds time, so the server's own cost is the low edge of the points: the FLOOR_QUANTILE line under them. A
+# request's time above that line is its delay.
+FLOOR_QUANTILE = .1
+FLOOR_RESAMPLES = 100
 
 
-def robust_prefill_fit(pairs):
-    """prefill_fit after leaving out stalls: requests far above the fitted line, refitting until none are left. A
-    queue or a busy server delays a request whatever its size, and a few such delays decide a least-squares slope.
-    "stalls" counts the requests left out."""
-    kept = list(pairs)
-    for _ in range(5):
-        fit = prefill_fit(kept)
-        if not fit:
-            return None
-        predicted = [fit["fixed_seconds"] + tokens / fit["marginal_tokens_per_second"] for tokens, _ in kept]
-        residuals = [seconds - guess for (_, seconds), guess in zip(kept, predicted)]
-        centre = statistics.median(residuals)
-        spread = 1.4826 * statistics.median(abs(r - centre) for r in residuals)
-        below = [pair for pair, residual, guess in zip(kept, residuals, predicted)
-                 if residual <= centre + max(STALL_SIGMAS * spread, STALL_FLOOR_SECONDS, STALL_SHARE * guess)]
-        if len(below) == len(kept):
-            break
-        kept = below
-    return {**fit, "stalls": len(pairs) - len(kept)}
+def floor_line(pairs, quantile=FLOOR_QUANTILE):
+    """(fixed seconds, seconds a token) of the quantile line under (fresh tokens, seconds) pairs, fixed held at 0 or
+    above. For a slope, the best fixed cost is the quantile of the time left after the per-token part. The pinball loss
+    is then convex in the slope, so a ternary search finds it."""
+    def place(slope):
+        left = sorted(seconds - slope * tokens for tokens, seconds in pairs)
+        fixed = max(0.0, left[int(quantile * (len(left) - 1))])
+        loss = sum(r * (quantile if r >= 0 else quantile - 1) for r in (value - fixed for value in left))
+        return loss, fixed
+    low, high = 0.0, max(seconds for _, seconds in pairs) / max(1, min(tokens for tokens, _ in pairs))
+    for _ in range(60):
+        third = (high - low) / 3
+        if place(low + third)[0] <= place(high - third)[0]:
+            high -= third
+        else:
+            low += third
+    slope = (low + high) / 2
+    return place(slope)[1], slope
+
+
+def floor_fit(pairs):
+    """The C=1 floor: the prefill rate and fixed cost of the FLOOR_QUANTILE line, the median delay above it, and the
+    fixed cost's 95% interval from seeded resamples. p is the share of resamples that find no per-token cost. None with
+    too few requests, no spread in size, or no positive slope."""
+    if len(pairs) < 5 or len({tokens for tokens, _ in pairs}) < 2:
+        return None
+    fixed, slope = floor_line(pairs)
+    if slope <= 0:
+        return None
+    rng = random.Random(0)
+    resampled = [floor_line([rng.choice(pairs) for _ in pairs]) for _ in range(FLOOR_RESAMPLES)]
+    fixes = sorted(value for value, _ in resampled)
+    flat = sum(1 for _, value in resampled if value < slope / 100) / FLOOR_RESAMPLES
+    return {"marginal_tokens_per_second": 1 / slope, "fixed_seconds": fixed, "samples": len(pairs), "p": flat,
+            "fixed_ci": (fixes[int(.975 * (len(fixes) - 1))] - fixes[int(.025 * (len(fixes) - 1))]) / 2,
+            "delay_seconds": statistics.median(seconds - fixed - slope * tokens for tokens, seconds in pairs)}
 
 
 # Warmup restarts at C=1. A first attempt whose requests all sit near one line ends warmup. Otherwise warmup starts
-# again from a fresh conversation, up to WARMUP_ATTEMPTS times, until each probe task's two fastest attempts are
-# within AGREE_SHARE or AGREE_SECONDS of each other. Delays only add time, so the fastest attempt is the best estimate,
-# and a second one close to it shows the fastest was not itself unusual. Two delayed attempts can agree by chance, so
-# agreement elsewhere does not count.
-WARMUP_ATTEMPTS = 5
+# again from a fresh conversation, up to WARMUP_ATTEMPTS times, or until each probe task's two fastest attempts are
+# within AGREE_SHARE or AGREE_SECONDS of each other. Delays only add time, so each probe's fastest attempt is the best
+# estimate either way, and agreement shows it was not itself unusual. On hy4-flash-dev even undelayed requests varied
+# by about 30%, so agreement alone could take more attempts than it is worth.
+WARMUP_ATTEMPTS = 3
 CLEAN_R2 = .95
 CLEAN_SHARE, AGREE_SHARE, AGREE_SECONDS = .2, .15, .3
 
@@ -653,20 +677,20 @@ def clean_attempt(session):
     return all(seconds - guess <= max(AGREE_SECONDS, CLEAN_SHARE * guess) for seconds, guess in predicted)
 
 
-def agreed_probes(attempts):
-    """{task: (fresh tokens, seconds)}: each probe task's fastest attempt, when its second fastest agrees with it.
-    None when some probe task's two fastest attempts disagree."""
+def fastest_probes(attempts):
+    """{task: [(fresh tokens, seconds), ...]}: each probe task's attempts, fastest first."""
     times = {}
     for session in attempts:
         for task, pair in probe_times(session).items():
             times.setdefault(task, []).append(pair)
-    agreed = {}
-    for task, pairs in times.items():
-        fastest, *rest = sorted(pairs, key=lambda pair: pair[1])
-        if not rest or rest[0][1] - fastest[1] > max(AGREE_SHARE * fastest[1], AGREE_SECONDS):
-            return None
-        agreed[task] = fastest
-    return agreed or None
+    return {task: sorted(pairs, key=lambda pair: pair[1]) for task, pairs in times.items()}
+
+
+def probes_agree(attempts):
+    """Whether every probe task's two fastest attempts are within AGREE_SHARE or AGREE_SECONDS of each other."""
+    probes = fastest_probes(attempts)
+    return bool(probes) and all(len(pairs) > 1 and pairs[1][1] - pairs[0][1] <= max(AGREE_SHARE * pairs[0][1], AGREE_SECONDS)
+                                for pairs in probes.values())
 
 
 def solo_warmup_attempts(report):
@@ -676,20 +700,10 @@ def solo_warmup_attempts(report):
 
 
 def card_prefill_fit(report):
-    """The C=1 prefill fit the card shows, the number of warmup attempts, and whether the probes agreed. After a
-    restart the fit runs through the agreed probes and the 3 fastest smaller requests, so the delays that forced the
-    restart stay out of it."""
-    attempts = solo_warmup_attempts(report)
-    if len(attempts) < 2:
-        fit = robust_prefill_fit(solo_prefill_pairs(report))
-        return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(attempts), None
-    agreed = agreed_probes(attempts)
-    if not agreed:
-        return None, len(attempts), False
-    smallest = min(tokens for tokens, _ in agreed.values())
-    small = sorted((pair for pair in solo_prefill_pairs(report) if pair[0] < smallest / 2), key=lambda pair: pair[1])
-    fit = prefill_fit(list(agreed.values()) + small[:3])
-    return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(attempts), True
+    """The C=1 floor fit the card shows over every C=1 request, every warmup attempt included, and the number of C=1
+    warmup attempts."""
+    fit = floor_fit(solo_prefill_pairs(report))
+    return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(solo_warmup_attempts(report))
 
 
 def level_fixed_seconds(report, fit):
@@ -1372,7 +1386,7 @@ def match_label(quality):
 
 
 def result_card(report, width=98):
-    fit, warmup_attempts, probes_agreed = card_prefill_fit(report)
+    fit, warmup_attempts = card_prefill_fit(report)
     fixed = fit["fixed_seconds"] if fit else 0.0
     level_fixed = level_fixed_seconds(report, fit) if fit else {}
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
@@ -1390,7 +1404,7 @@ def result_card(report, width=98):
          "text": f"C={lanes} stopped during {info['phase']}"
                  + (f" at about {context_label(info['context_tokens'])} total context "
                     f"({context_label(info['context_tokens_per_lane'])} per stream)" if info.get('context_tokens') else "")
-                 + f": {report.get('termination_reason') or 'run stopped'}"
+                 + f": {(report.get('termination_reason') or 'run stopped').rstrip('.')}"
                  + (f". Prefix cache hits: {info['cache_hit_share']:.0%} of prompt tokens"
                     if info.get('cache_hit_share') is not None else "")}
         for lanes, info in sorted(stopped.items(), key=lambda item: int(item[0]))] + [
@@ -1518,23 +1532,17 @@ def result_card(report, width=98):
         if summary.get("context_limited_sessions"):
             add(f"C={lanes} context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
     if warmup_attempts > 1:
-        text = f"Warmup ran {warmup_attempts} times at C=1 because its probe times disagreed. " + (
-            "The prefill fit uses the probes that agreed." if fit else
-            "The probes agreed but do not fit one line, so the card shows no prefill fit." if probes_agreed else
-            "No probe agreed with another attempt, so prefill could not be told apart from the fixed cost.")
-        for line in textwrap.wrap(text, width=width - 4):
-            add(line)
+        add(f"Warmup ran {warmup_attempts} times at C=1 because its requests did not sit on one line.")
     if fit:
-        r2 = f", R² {fit['r2']:.2f}" if fit.get("r2") is not None else ""
-        p = "p < 0.001" if fit["p"] < 0.001 else f"p {fit['p']:.3f}"
-        ci = f" ±{fit['fixed_ci']:.2f}" if fit["fixed_ci"] else ""
-        stalls = f", {fit['stalls']} stalled left out" if fit.get("stalls") else ""
-        basis = "agreed probes and fastest small requests" if probes_agreed else "requests"
-        for line in textwrap.wrap(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + "
-                                  f"{fit['fixed_seconds']:.2f}s{ci} a request ({fit['samples']} {basis}{stalls}{r2}, {p})",
-                                  width=width - 4):
+        p = "p < 0.01" if fit["p"] < 0.01 else f"p {fit['p']:.2f}"
+        for line in textwrap.wrap(f"Prefill floor (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + "
+                                  f"{fit['fixed_seconds']:.2f}s ±{fit['fixed_ci']:.2f} a request, the low "
+                                  f"{FLOOR_QUANTILE:.0%} line of {fit['samples']} requests ({p}). Requests wait a median "
+                                  f"{fit['delay_seconds']:.2f}s above it.", width=width - 4):
             add(line)
-        add("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates leave it out.")
+        for line in textwrap.wrap("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates "
+                                  "leave it out.", width=width - 4):
+            add(line)
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
@@ -1560,6 +1568,15 @@ def result_card(report, width=98):
         split_note("Buffered stream", buffered, "arrived in one burst")
     if unstreamed:
         split_note("Not streamed", unstreamed, "came as one response")
+    runaways = sum(1 for run in report.get("runs", []) for session in run["sessions"] + run.get("filler_sessions", [])
+                   for request in session.get("requests", [])
+                   if "max_tokens" in ((request.get("validation") or {}).get("message") or ""))
+    if runaways:
+        replies = "reply ran" if runaways == 1 else "replies ran"
+        counts = "counts as a failed task" if runaways == 1 else "count as failed tasks"
+        for line in textwrap.wrap(f"Max tokens: {runaways} measured {replies} on to max_tokens without thinking and "
+                                  f"{counts}.", width=width - 4):
+            add(line)
     bursty = sum(1 for t in timed if not t.get("buffered") and (t.get("first_burst_chunks") or 0) > 1)
     if bursty:
         for line in textwrap.wrap(f"Decode: {bursty} of {len(timed)} replies arrived in network bursts, so decode is "
@@ -2320,9 +2337,8 @@ class VirtualClock:
             if job['control'].stopped:
                 job['error'] = RunCancelled(job['control'].reason)
             elif self.now >= job['deadline'] - 1e-9:
-                message = f"{job['label']} exceeded the {job['timeout']:g}s response deadline (virtual model)"
-                job['control'].terminate('overload', message)
-                job['error'] = ToolDeadlineExceeded(message)
+                job['error'] = ToolDeadlineExceeded(f"{job['label']} exceeded the {job['timeout']:g}s response deadline "
+                                                    "(virtual model)")
             if job['error']:
                 job['done'] = True
                 del self.jobs[lane]
@@ -2439,8 +2455,11 @@ class VirtualModel:
                 if result.get('next_task_id'):
                     target = result['next_task_id']
         if stage == 'auto':
-            # A perfect agent: the next tool follows from the last tool result.
-            last = next((json.loads(m['content']) for m in reversed(messages) if m['role'] == 'tool'), {})
+            # A perfect agent: the next tool follows from the last tool result, unless the harness moved it on to a
+            # new task after that result.
+            latest = next((m for m in reversed(messages) if m['role'] == 'tool' or (
+                m['role'] == 'user' and m.get('content', '').startswith('Continue with task ID '))), {'role': 'user'})
+            last = json.loads(latest['content']) if latest['role'] == 'tool' else {}
             stage = ('submit_result' if 'submit_key' in last else 'read_file' if 'path' in last else 'search_records')
         if stage == 'search_records':
             args = {'id': target}
@@ -2479,10 +2498,13 @@ class VirtualModel:
         return response
 
 
-VERSION = "ripal-v17"
+VERSION = "ripal-v18"
 # Seeds task generation. v16 balances the target record's position (target_position), so its tasks differ from v13's.
-# v17 moves half the seeded history into warmup prefill probes (probe_words), so v16 runs cannot be resumed.
-WORKLOAD_VERSION = "ripal-v17"
+# v17 moved half the seeded history into warmup prefill probes (probe_words) as random filler words. v18 makes the
+# probes distractor records (hy4-flash-dev pasted record JSON into its answer after 3,809 filler words), and keeps
+# v16's measured tasks and conversation size, so the score of a server matches v16's. The warmup differs, so v18 runs
+# only resume v18 runs.
+WORKLOAD_VERSION = "ripal-v16"
 # Protocols that sent temperature 0 in every request without recording it.
 OLD_TEMPERATURE_ZERO = {"ripal-v11", "ripal-v12", "ripal-v13"}
 TARGET_RATIO = 2.0
@@ -2692,8 +2714,18 @@ def resize_task(task, config, words):
         if transformation == "invert_case":
             payload = [mixed_case(word, rng) for word in payload]
         records.append({"id": record_id, "revision": revision, "payload": " ".join(payload)})
-    task.update(target=records[target_index], words=words,
-                contents="\n".join(json.dumps(record) for record in records))
+    target = records[target_index]
+    if task.get("probe_words"):
+        # A probe adds full-size distractor records, then shuffles the file, so the target can sit anywhere in it. Its
+        # records stay lowercase whatever the transformation: mixed case cost hy4-flash-dev about twice the tokens a
+        # word, and the probe's tokens should match the history words it replaces.
+        probe = random.Random(f"{task['record_seed']}:probe:{task.get('probe_nonce', '')}")
+        for _ in range(math.ceil(task["probe_words"] / words)):
+            payload = probe.choices(vocabulary, k=words)
+            records.append({"id": f"record-{probe.getrandbits(64):016x}", "revision": probe.randrange(1, 1000),
+                            "payload": " ".join(payload)})
+        probe.shuffle(records)
+    task.update(target=target, words=words, contents="\n".join(json.dumps(record) for record in records))
     return task
 
 
@@ -2712,15 +2744,69 @@ def make_session(config, session, task_offset=0):
     return tasks
 
 
-# Warmup prefill probes. The warmup tasks after the first add fresh filler to their read results, in sizes that grow
+# Warmup prefill probes. The warmup tasks after the first add distractor records to their files, in sizes that grow
 # PROBE_GROWTH times a step, so the C=1 prefill fit sees fresh tokens from hundreds to tens of thousands. The probe
 # words come out of the seeded history, so measured tasks run at the same context.
 PROBE_SHARE = .5
 PROBE_GROWTH = 4
 
 
+# v16 warmed up with 2 plain tasks. Measured tasks keep the seeds and positions they had after those 2, whatever
+# --warmup-tasks is set to, and the history gives up the words the larger warmup adds, so a server's score matches v16's.
+BASELINE_WARMUPS = 2
+
+
+def task_weighted_words(task):
+    """Weighted words a completed task adds to a conversation: its three tool calls and their results."""
+    target = task["target"]
+    calls = [({"id": target["id"]}, {"path": task["path"]}),
+             ({"path": task["path"]}, {"contents": task["contents"], "read_padding": task["read_padding"],
+                                       "transformation": task["transformation"], **read_instructions(task["transformation"])}),
+             ({"id": target["id"], "revision": target["revision"],
+               "text": transform(target["payload"], task["transformation"])}, {"ok": True})]
+    return sum(weighted_words(json.dumps(arguments)) + weighted_words(json.dumps(result)) for arguments, result in calls)
+
+
+def warmup_workload(config, session, warmup_tasks, probes):
+    """A lane's tasks, and the weighted words its warmup adds beyond v16's BASELINE_WARMUPS plain tasks. The first
+    BASELINE_WARMUPS warmups and every measured task are v16's. Extra warmups come from their own seed."""
+    plain = make_session(replace(config, tasks=BASELINE_WARMUPS + config.tasks), session)
+    seed = int.from_bytes(hashlib.sha256(f"{config.seed}:extra-warmups".encode()).digest()[:8], "big")
+    extra = make_session(replace(config, seed=seed, tasks=max(0, warmup_tasks - BASELINE_WARMUPS)), session,
+                         task_offset=BASELINE_WARMUPS)
+    warmups = (plain[:BASELINE_WARMUPS] + extra)[:warmup_tasks]
+    # A shorter warmup than v16's gives the missing words back to the history.
+    added = (sum(task_weighted_words(task) for task in warmups[BASELINE_WARMUPS:])
+             - sum(task_weighted_words(task) for task in plain[warmup_tasks:BASELINE_WARMUPS]))
+    for task, words in zip(warmups, probes):
+        if words:
+            before = weighted_words(json.dumps({"contents": task["contents"]}))
+            sized = resize_task({**task, "probe_words": words}, config, config.words)
+            added += weighted_words(json.dumps({"contents": sized["contents"]})) - before
+            task["probe_words"] = words
+    return warmups + plain[BASELINE_WARMUPS:], added
+
+
+def matched_history_words(config, added):
+    """The history budget whose whole tasks come closest to v16's history less `added` weighted words. history_messages
+    adds whole tasks until it reaches its budget, so subtracting from the budget alone would change its overshoot."""
+    if not added or not config.history_words:
+        return config.history_words
+    full = history_messages(replace(config, history_words=config.history_words + abs(added) + 4096), 0)
+    totals, words, tasks = [], 0.0, 0
+    for message in full:
+        words += weighted_words(json.dumps(message))
+        if message["role"] == "tool" and '"ok": true' in message["content"]:
+            totals.append(words)
+    baseline = next((total for total in totals if total >= config.history_words), totals[-1])
+    best = min(totals, key=lambda total: abs(total - (baseline - added)))
+    # history_messages stops at the first task whose running total reaches the budget.
+    return max(1, int(best) - 1)
+
+
 def probe_words(history_words, warmup_tasks):
-    """Fresh filler words for each warmup task. The first task prefills the history, so it gets none."""
+    """Payload words of probe distractor records for each warmup task. The first task prefills the history, so it gets
+    none."""
     weights = [0] + [PROBE_GROWTH ** ((index - 1) % 3) for index in range(1, warmup_tasks)]
     total, budget = sum(weights), int(history_words * PROBE_SHARE)
     return [budget * weight // total if total else 0 for weight in weights]
@@ -2848,15 +2934,21 @@ def pause(control, seconds):
         real_time.sleep(min(.25, left))
 
 
-def max_tokens_reason(stage, response, extra, max_tokens, auto):
-    """Says which reply reached max_tokens and what to change. Later replies would likely reach the same limit, so
-    the run stops."""
+def reasoning_tokens(response):
+    count = ((response.get("usage") or {}).get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return count if isinstance(count, int) and not isinstance(count, bool) else 0
+
+
+def max_tokens_reason(stage, response, extra, max_tokens, auto, thinking=True):
+    """Says which reply reached max_tokens and what to change. The run stops when the reply spent its budget thinking,
+    or when it is the level's second answer that ran on."""
     limit = extra.get("max_completion_tokens", extra.get("max_tokens", max_tokens))
-    usage = response.get("usage") or {}
-    thinking = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
-    output = usage.get("completion_tokens")
-    spent = (f" ({thinking:,} of {output:,} tokens were thinking)"
-             if isinstance(thinking, int) and isinstance(output, int) and thinking else "")
+    if not thinking:
+        return (f"A second {stage} reply in this level ran on to max_tokens ({limit:,}) without thinking. Check the "
+                "replies in the results JSON, or rerun with a higher --max-tokens.")
+    output = (response.get("usage") or {}).get("completion_tokens")
+    spent = (f" ({reasoning_tokens(response):,} of {output:,} tokens were thinking)"
+             if isinstance(output, int) and reasoning_tokens(response) else "")
     template = """--extra-body '{"chat_template_kwargs": {"enable_thinking": false}}'"""
     fix = (f"Rerun with --forced-tool-choice true, or lower the thinking level in the chat template, e.g. {template}."
            if auto else f"Rerun with a lower thinking level in the chat template, e.g. {template}, or a higher --max-tokens.")
@@ -3035,6 +3127,9 @@ def run_session(client, config, tasks, session, state=None):
                 control.check()
             task_ok, aborted = True, False
             dependency_ok, quality_credit, transform_score, edit = True, 0.0, None, None
+            if task.get("probe_words"):
+                # Fresh probe records each attempt, so no earlier attempt or run's prefix cache holds them.
+                task["probe_nonce"] = os.urandom(8).hex()
             resize_task(task, config, config.words)
             target = task["target"]
             words = task["words"]
@@ -3063,9 +3158,6 @@ def run_session(client, config, tasks, session, state=None):
             padding_words = mix_control.plan(expected, index + 1)
             padding = " ".join(random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
             probe = task.get("probe_words", 0)
-            if probe:
-                # The filler is drawn fresh each run, so no earlier run's prefix cache holds it. The word mix leaves it out.
-                padding = " ".join(filter(None, [padding, " ".join(random.Random().choices(WORDS, k=probe))]))
             expected[1][2]["read_padding"] = padding
             task_config = replace(config, words=words, max_tokens=max(config.max_tokens, len(expected_text.encode()) + 256))
             extra = getattr(client, "extra", {})
@@ -3145,11 +3237,20 @@ def run_session(client, config, tasks, session, state=None):
                         if len(tool_calls) == 1 and tool_calls[0].get("id"):
                             call = tool_calls[0]
                         if choice.get("finish_reason") == "length":
+                            if phase == "warmup":
+                                # Warmup falls outside scored time, so a runaway reply fails its task and warmup goes on.
+                                raise ValueError(f"reply reached max_tokens ({task_config.max_tokens:,}) in warmup")
                             if control is None:
                                 control = RunControl()
                                 client.control = control
+                            # A model that uses its budget thinking will do so again, so the run stops. An answer that
+                            # ran on once fails its task. A second one in the level stops the run too.
+                            thinking = bool(reasoning_tokens(response) or message.get("reasoning_content"))
+                            if not thinking and control.first_miss("max_tokens"):
+                                raise ValueError(f"reply ran on to max_tokens ({task_config.max_tokens:,}) without "
+                                                 "thinking; it counts as a failed task")
                             control.terminate("max_tokens", max_tokens_reason(stage, response, getattr(client, "extra", {}),
-                                                                             task_config.max_tokens, auto))
+                                                                             task_config.max_tokens, auto, thinking))
                             emit(client, "STOP " + control.reason)
                             raise MaxTokensReached(control.reason)
                         if auto:
@@ -3197,8 +3298,18 @@ def run_session(client, config, tasks, session, state=None):
                             if control is None:
                                 control = RunControl()
                                 client.control = control
+                            if timed_out and not control.stopped and control.first_miss("deadline"):
+                                # One slow request on a busy server fails its task. A second in the level stops the run.
+                                issue = {"kind": "tool_timeout", "message": f"{exc}; the task fails, and a second miss "
+                                         "in this level stops the run"}
+                                emit(client, f"FAIL lane {session + 1} task {index + 1} {stage}: {issue['message']}")
+                                entry.update({"seconds": time.perf_counter() - request_started, "received_response": False,
+                                              "validation": issue})
+                                aborted = True
+                                break
                             message = (f"HTTP 429 Too Many Requests during {stage}" if rate_limited else
-                                       f"{stage} hit the {getattr(client, 'timeout', 60):g}s response deadline (possible server overload)")
+                                       f"{stage} missed its {getattr(client, 'timeout', 60):g}s response deadline twice in "
+                                       "this level (possible server overload)")
                             control.terminate("overload", message)
                             entry.update({"seconds": time.perf_counter() - request_started,
                                           "received_response": rate_limited,
@@ -3439,7 +3550,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
                 finished_cleanly = not (warm["error"] or warm["interrupted"] or warm["context_limited"]
                                         or stop_requested(client))
                 if (not probed or not finished_cleanly or len(attempts) >= WARMUP_ATTEMPTS or clean_attempt(warm)
-                        or (len(attempts) > 1 and agreed_probes(attempts))):
+                        or (len(attempts) > 1 and probes_agree(attempts))):
                     break
                 emit(client, f"Warmup probes at C=1 disagree after attempt {len(attempts)}; starting warmup again "
                              f"from a fresh conversation ({len(attempts) + 1} of {WARMUP_ATTEMPTS})")
@@ -3465,7 +3576,9 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             while not finished.is_set() and not stage_control.stopped and not stage_control.expired:
                 seed = int.from_bytes(hashlib.sha256(f"{config.seed}:filler:{index}:{sequence}".encode()).digest()[:8], "big")
                 filler_config = replace(config, seed=seed, tasks=1, filler=False, filler_words=padding, words=filler_words)
-                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index, state=state)
+                # Filler tasks follow the measured ones at the offsets they had after v16's warmup.
+                offset = BASELINE_WARMUPS + len(tasks) - warmup_tasks + sequence
+                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=offset), index, state=state)
                 item.update({"filler": True, "seed": seed})
                 filler_words = item["next_words"]
                 if item["mix_adjustments"]:
@@ -3991,8 +4104,8 @@ def resume_args(parser, args):
     """Load a stopped run's settings into args, keeping only the levels it did not finish."""
     raw = json.loads(args.resume.read_text())
     saved = raw["config"]["benchmark_version"]
-    if saved != VERSION and saved != WORKLOAD_VERSION:
-        raise ValueError(f"saved under {saved}; this script runs {VERSION} and can resume {WORKLOAD_VERSION} or {VERSION}")
+    if saved != VERSION:
+        raise ValueError(f"saved under {saved}; this script runs {VERSION} and resumes only {VERSION} runs")
     prior = report_from_telemetry(raw)
     for key, value in raw["config"]["parameters"].items():
         if key in ("resume", "render", "card_output", "output") or not hasattr(args, key):
@@ -4174,12 +4287,10 @@ def run_benchmark(args, client, config):
                          f"(--max-server-context {args.max_server_context:,} / {lanes})")
         client.first_request_retries = args.first_request_retries
         probes = probe_words(batch_config.history_words, args.warmup_tasks)
-        batch_config = replace(batch_config, history_words=batch_config.history_words - sum(probes))
-        workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
-        workload = [make_session(workload_config, index) for index in range(lanes)]
-        for tasks in workload:
-            for task, words in zip(tasks, probes):
-                task["probe_words"] = words
+        lanes_work = [warmup_workload(batch_config, index, args.warmup_tasks, probes) for index in range(lanes)]
+        workload = [tasks for tasks, _ in lanes_work]
+        added = max(words for _, words in lanes_work)
+        batch_config = replace(batch_config, history_words=matched_history_words(batch_config, added))
         run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
                           stage_prefill_rate=args.stage_prefill_rate, stage_timeout=args.stage_timeout)
         run["tool_timeout_seconds"] = deadline

@@ -89,30 +89,34 @@ putting all non-thinking models above all thinking models. $0.5$ was effectively
 
 A request that adds a few hundred tokens to a long cached history spends most of its prefill time on what the server
 does for any request, so fresh tokens over prefill time can read far below the server's real prefill rate. The card
-fits every C=1 request, warmup and measured (one lane, so no queueing): the seconds each further fresh token costs, as
-a rate, and the seconds a request pays at any size, with its 95% interval. The fixed cost is never below zero. The fit
-is used when its slope passes a two-sided t test at p < 0.05.
+fits every C=1 request, warmup and measured (one lane, so no queueing), to the seconds each further fresh token
+costs, as a rate, and the seconds a request pays at any size.
 
-A request delayed by a queue or a busy server takes longer whatever its size, and a few of them can decide a
-least-squares slope. The fit leaves out a request that sits more than 3 robust standard deviations above its line,
-and at least 0.25 s and a quarter of its predicted time above it. Then the fit runs again, until no such request is
-left. The card counts the requests left out as stalled. The quarter keeps a server whose prefill slows smoothly with
-context from being read as stalling.
+A queue or a busy server delays a request whatever its size, and on a shared endpoint most requests can wait. A delay
+only adds time, so the fit takes the low edge of the points: the line with 10% of requests below it, with the fixed
+cost held at zero or above. Each request's time above that line is its wait, and the card reports the median. The
+fixed cost's 95% interval comes from 100 seeded resamples. The card shows the fit when under 5% of resamples put the
+per-token cost at zero.
 
 Measured tasks add similar amounts of fresh input, too narrow a range to separate the two costs on a fast server. So
-the warmup tasks after the first are prefill probes: each adds fresh filler to its read result, in sizes that grow 4x
-a step, from half the seeded history's word budget. The history shrinks by the same amount, so measured tasks run at
-the same context. With 4 warmup tasks (the default) and a 40,000-word history, the probes add about 950, 3,800 and
-15,200 words. The filler is drawn fresh each run, so no earlier run's prefix cache holds it.
+the warmup tasks after the first are prefill probes: each adds distractor records to its file, full-size records of
+the same shape with their own IDs, in sizes that grow 4x a step, from half the seeded history's word budget. The file
+is shuffled, so the target can sit anywhere in it. Measured tasks keep the seeds they had after v16's 2 plain warmup
+tasks, whatever --warmup-tasks is set to. The history gives up the weighted words the larger warmup adds, to the
+nearest whole history task, so measured tasks run at about the same context as in v16 and a server scores the same.
+With 4 warmup tasks (the default) and a 40,000-word history, the probes add about 4, 15 and 60 records (950, 3,800
+and 15,200 words). The records are drawn fresh each attempt, so no earlier attempt or run's prefix cache holds them.
 
-A server that delays many requests, such as a shared endpoint with a queue, can delay the probes too. So at C=1,
-warmup ends after its first attempt only when every request in it sits near one fixed + per-token line (R² at least
-0.95, none more than 20% or 0.3 s above it). Otherwise the lane starts warmup again from a fresh conversation, up to
-5 attempts, until each probe's two fastest attempts are within 15% or 0.3 s of each other. Delays only add time, so
-the fastest attempt is the best estimate, and a second one close to it shows the fastest was not unusual. The
-measured run continues from the last attempt, so its context does not change. After a restart, the fit runs through
-the agreed probes and the 3 fastest smaller requests. If the probes never agree, the card says so and leaves the fit
-out.
+A server that delays many requests can delay the probes too. So at C=1, warmup ends after its first attempt only when
+every request in it sits near one fixed + per-token line (R² at least 0.95, none more than 20% or 0.3 s above it).
+Otherwise the lane starts warmup again from a fresh conversation, up to 3 attempts, or until each probe's two fastest
+attempts are within 15% or 0.3 s of each other. Every attempt's requests go into the fit, so another attempt can make
+up for a delayed probe. The measured run continues from the last attempt, so its context does not change. A warmup
+reply that reaches max_tokens fails its task, and warmup goes on, since warmup falls outside scored time.
+
+One request past its response deadline fails its task, and the run goes on. So does one measured reply that runs on
+to max_tokens without thinking. A second of either in the same level stops the run, and so does a reply that reaches
+max_tokens while thinking, since a model that thinks past its budget will keep doing it.
 
 The Fixed (s) column is each level's fixed cost: the fit's, or that level's median (prefill seconds less fresh tokens at
 the fit's rate) where that is smaller, since some servers spend less a request under load. The prefill column and the
