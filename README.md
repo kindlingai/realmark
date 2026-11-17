@@ -105,6 +105,15 @@ a step, from half the seeded history's word budget. The history shrinks by the s
 the same context. With 4 warmup tasks (the default) and a 40,000-word history, the probes add about 950, 3,800 and
 15,200 words. The filler is drawn fresh each run, so no earlier run's prefix cache holds it.
 
+A server that delays many requests, such as a shared endpoint with a queue, can delay the probes too. So at C=1,
+warmup ends after its first attempt only when every request in it sits near one fixed + per-token line (R² at least
+0.95, none more than 20% or 0.3 s above it). Otherwise the lane starts warmup again from a fresh conversation, up to
+5 attempts, until each probe's two fastest attempts are within 15% or 0.3 s of each other. Delays only add time, so
+the fastest attempt is the best estimate, and a second one close to it shows the fastest was not unusual. The
+measured run continues from the last attempt, so its context does not change. After a restart, the fit runs through
+the agreed probes and the 3 fastest smaller requests. If the probes never agree, the card says so and leaves the fit
+out.
+
 The Fixed (s) column is each level's fixed cost: the fit's, or that level's median (prefill seconds less fresh tokens at
 the fit's rate) where that is smaller, since some servers spend less a request under load. The prefill column and the
 prefill charts leave it out. Without a fit, the column shows a dash and the prefill rates include it.

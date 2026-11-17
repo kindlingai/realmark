@@ -616,6 +616,82 @@ def robust_prefill_fit(pairs):
     return {**fit, "stalls": len(pairs) - len(kept)}
 
 
+# Warmup restarts at C=1. A first attempt whose requests all sit near one line ends warmup. Otherwise warmup starts
+# again from a fresh conversation, up to WARMUP_ATTEMPTS times, until each probe task's two fastest attempts are
+# within AGREE_SHARE or AGREE_SECONDS of each other. Delays only add time, so the fastest attempt is the best estimate,
+# and a second one close to it shows the fastest was not itself unusual. Two delayed attempts can agree by chance, so
+# agreement elsewhere does not count.
+WARMUP_ATTEMPTS = 5
+CLEAN_R2 = .95
+CLEAN_SHARE, AGREE_SHARE, AGREE_SECONDS = .2, .15, .3
+
+
+def session_prefill(session):
+    """(task, fresh tokens, prefill seconds) of a session's answered requests."""
+    return [(request["task"], *pair) for request in session.get("requests", [])
+            if request.get("received_response") and not request.get("cancelled") and request.get("phase_timing")
+            for pair in [prefill_sample(request["phase_timing"])] if pair]
+
+
+def probe_times(session):
+    """{task: (fresh tokens, seconds)} of each probe task's largest request, the one after its read result. The first
+    warmup task carries no probe."""
+    largest = {}
+    for task, tokens, seconds in session_prefill(session):
+        if task > 1 and (task not in largest or tokens > largest[task][0]):
+            largest[task] = (tokens, seconds)
+    return largest
+
+
+def clean_attempt(session):
+    """Whether every request of a warmup attempt sits near one fixed + per-token line."""
+    pairs = [(tokens, seconds) for _, tokens, seconds in session_prefill(session)]
+    fit = prefill_fit(pairs)
+    if not fit or fit["p"] >= PREFILL_FIT_P or (fit["r2"] or 0) < CLEAN_R2:
+        return False
+    predicted = [(seconds, fit["fixed_seconds"] + tokens / fit["marginal_tokens_per_second"]) for tokens, seconds in pairs]
+    return all(seconds - guess <= max(AGREE_SECONDS, CLEAN_SHARE * guess) for seconds, guess in predicted)
+
+
+def agreed_probes(attempts):
+    """{task: (fresh tokens, seconds)}: each probe task's fastest attempt, when its second fastest agrees with it.
+    None when some probe task's two fastest attempts disagree."""
+    times = {}
+    for session in attempts:
+        for task, pair in probe_times(session).items():
+            times.setdefault(task, []).append(pair)
+    agreed = {}
+    for task, pairs in times.items():
+        fastest, *rest = sorted(pairs, key=lambda pair: pair[1])
+        if not rest or rest[0][1] - fastest[1] > max(AGREE_SHARE * fastest[1], AGREE_SECONDS):
+            return None
+        agreed[task] = fastest
+    return agreed or None
+
+
+def solo_warmup_attempts(report):
+    """Lane 1's C=1 warmup attempts, in order."""
+    return [session for run in report.get("warmup_runs", []) if run.get("lanes") == 1
+            for session in run["sessions"] if session.get("session", 0) == 0]
+
+
+def card_prefill_fit(report):
+    """The C=1 prefill fit the card shows, the number of warmup attempts, and whether the probes agreed. After a
+    restart the fit runs through the agreed probes and the 3 fastest smaller requests, so the delays that forced the
+    restart stay out of it."""
+    attempts = solo_warmup_attempts(report)
+    if len(attempts) < 2:
+        fit = robust_prefill_fit(solo_prefill_pairs(report))
+        return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(attempts), None
+    agreed = agreed_probes(attempts)
+    if not agreed:
+        return None, len(attempts), False
+    smallest = min(tokens for tokens, _ in agreed.values())
+    small = sorted((pair for pair in solo_prefill_pairs(report) if pair[0] < smallest / 2), key=lambda pair: pair[1])
+    fit = prefill_fit(list(agreed.values()) + small[:3])
+    return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(attempts), True
+
+
 def level_fixed_seconds(report, fit):
     """Each level's fixed prefill seconds: the C=1 fit's, or that level's median implied fixed cost (prefill seconds
     less fresh tokens at the fit's rate) where that is smaller, so a level where requests get cheaper under load is
@@ -1296,8 +1372,7 @@ def match_label(quality):
 
 
 def result_card(report, width=98):
-    fit = robust_prefill_fit(solo_prefill_pairs(report))
-    fit = fit if fit and fit["p"] < PREFILL_FIT_P else None
+    fit, warmup_attempts, probes_agreed = card_prefill_fit(report)
     fixed = fit["fixed_seconds"] if fit else 0.0
     level_fixed = level_fixed_seconds(report, fit) if fit else {}
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
@@ -1442,13 +1517,23 @@ def result_card(report, width=98):
             add(f"C={lanes} time cap: {elapsed:.1f}s observed; {estimate}.")
         if summary.get("context_limited_sessions"):
             add(f"C={lanes} context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
+    if warmup_attempts > 1:
+        text = f"Warmup ran {warmup_attempts} times at C=1 because its probe times disagreed. " + (
+            "The prefill fit uses the probes that agreed." if fit else
+            "The probes agreed but do not fit one line, so the card shows no prefill fit." if probes_agreed else
+            "No probe agreed with another attempt, so prefill could not be told apart from the fixed cost.")
+        for line in textwrap.wrap(text, width=width - 4):
+            add(line)
     if fit:
         r2 = f", R² {fit['r2']:.2f}" if fit.get("r2") is not None else ""
         p = "p < 0.001" if fit["p"] < 0.001 else f"p {fit['p']:.3f}"
         ci = f" ±{fit['fixed_ci']:.2f}" if fit["fixed_ci"] else ""
-        stalls = f", {fit['stalls']} stalled left out" if fit["stalls"] else ""
-        add(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + {fit['fixed_seconds']:.2f}s{ci} a request "
-            f"({fit['samples']} requests{stalls}{r2}, {p})")
+        stalls = f", {fit['stalls']} stalled left out" if fit.get("stalls") else ""
+        basis = "agreed probes and fastest small requests" if probes_agreed else "requests"
+        for line in textwrap.wrap(f"Prefill fit (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + "
+                                  f"{fit['fixed_seconds']:.2f}s{ci} a request ({fit['samples']} {basis}{stalls}{r2}, {p})",
+                                  width=width - 4):
+            add(line)
         add("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates leave it out.")
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
@@ -3301,6 +3386,8 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
     measurement_started_at = None
     warmup_started_at = time.perf_counter()
     warmup_sessions = []
+    # Every warmup attempt, in order. warmup_sessions holds each lane's last attempt. The measured run continues it.
+    all_warmups = []
     time_budget = {}
     stage_control = StageControl(client.control, lanes)
     virtual = getattr(client, "virtual_clock", None)
@@ -3339,13 +3426,27 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
         barrier.wait()
         # Lanes prefill their histories together, so each gets a share of the prefill floor.
         per_word = HISTORY_TOKENS_PER_WORD * lanes / (stage_prefill_rate or 1000)
-        state = {"history_deadline_seconds": per_word * config.history_words, "prefill_seconds_per_word": per_word}
+        fresh_state = lambda: {"history_deadline_seconds": per_word * config.history_words, "prefill_seconds_per_word": per_word}
+        state = fresh_state()
         if warmup_tasks:
             warm_config = replace(config, tasks=warmup_tasks, filler=False)
             warm_client = PhaseClient(stage_client, "warmup")
-            warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
+            probed = lanes == 1 and any(task.get("probe_words") for task in tasks[:warmup_tasks])
+            attempts = []
+            while True:
+                warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
+                attempts.append(warm)
+                finished_cleanly = not (warm["error"] or warm["interrupted"] or warm["context_limited"]
+                                        or stop_requested(client))
+                if (not probed or not finished_cleanly or len(attempts) >= WARMUP_ATTEMPTS or clean_attempt(warm)
+                        or (len(attempts) > 1 and agreed_probes(attempts))):
+                    break
+                emit(client, f"Warmup probes at C=1 disagree after attempt {len(attempts)}; starting warmup again "
+                             f"from a fresh conversation ({len(attempts) + 1} of {WARMUP_ATTEMPTS})")
+                state = fresh_state()
             with lock:
                 warmup_sessions.append(warm)
+                all_warmups.extend(attempts)
         if virtual:
             virtual.pause_lane(index)
         measurement_barrier.wait()
@@ -3432,7 +3533,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             "effective_sessions": credit, "sessions": sessions, "completed_words": completed_words, "estimated_planned_words": forecast_words, "token_mix": observed_mix,
             "primary_token_mix": primary_mix, "filler_sessions": filler_sessions,
             "word_mix": combine_word_mix(s["word_mix"] for s in sessions + filler_sessions),
-            "warmup_sessions": warmup_sessions, "warmup_seconds": warmup_seconds,
+            "warmup_sessions": all_warmups, "warmup_seconds": warmup_seconds,
             "has_measurements": any(s["requests"] for s in sessions),
             "filler_completed_tasks": sum(s["load_completed_tasks"] for s in filler_sessions),
             "filler_cancelled_requests": sum(s["cancelled_requests"] for s in filler_sessions),
