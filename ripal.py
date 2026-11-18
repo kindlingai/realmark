@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 import argparse
+import atexit
 import hashlib
 import json
 import math
@@ -18,10 +19,12 @@ import os
 import queue
 import random
 import re
+import shlex
 import shutil
 import signal
 import socket
 import statistics
+import subprocess
 import sys
 import textwrap
 import threading
@@ -35,7 +38,13 @@ class Clock:
 
     @property
     def virtual(self):
-        return self.backend is not None
+        """Whether time is the simulator's simulated clock, which moves only while lanes wait on it."""
+        return isinstance(self.backend, SimClock) and self.backend.speed is None
+
+    @property
+    def simulated(self):
+        """The simulator's clock when it is simulated, else None."""
+        return self.backend if self.virtual else None
 
     def perf_counter(self):
         return self.backend.now if self.backend else real_time.perf_counter()
@@ -56,6 +65,123 @@ time = clock  # Shared name in the standalone bundle.
 
 class RunCancelled(Exception):
     pass
+
+
+class SimClock:
+    """The client side of the simulator's clock (see ripal_sim.py). On simulated time the server owns the clock: this
+    keeps the latest time it reported, names each request's lane and checkpoint in headers, and decides for its lanes
+    whenever the server stops its clock at a checkpoint. On --realtime SPEED, `speed` is set, and the time is the wall
+    clock since start times SPEED, so a run reports simulated seconds while it takes 1/SPEED of them."""
+    def __init__(self, base_url, speed=None):
+        self.root = base_url[:-3] if base_url.endswith("/v1") else base_url
+        self.speed, self.origin = speed, real_time.perf_counter()
+        self.latest, self.epoch, self.serial = 0.0, real_time.time(), 0
+        self.local = threading.local()
+        self.lock = threading.Lock()
+        self.stage_control = None
+        self.enforce_response_deadlines = False
+        if speed is None:
+            self.event("poll")
+
+    @property
+    def now(self):
+        """The time of the stream this thread is reading, if any, else the latest time the server reported. Lanes read
+        their streams in real-time order, so another lane may already have seen a later time."""
+        if self.speed is not None:
+            return (real_time.perf_counter() - self.origin) * self.speed
+        stream = getattr(self.local, "stream", None)
+        return stream if stream is not None else self.latest
+
+    def observe(self, headers):
+        """Takes the simulated time, epoch and deadline setting from a response's headers."""
+        value = headers.get("X-Sim-Clock")
+        if value:
+            with self.lock:
+                self.latest = max(self.latest, float(value))
+        if headers.get("X-Sim-Epoch"):
+            self.epoch = float(headers["X-Sim-Epoch"])
+        if headers.get("X-Sim-Deadlines"):
+            self.enforce_response_deadlines = headers["X-Sim-Deadlines"] == "1"
+        return headers
+
+    def tick(self, value):
+        """Takes the simulated time of a stream event from its ": clock=T" comment."""
+        self.local.stream = value
+        with self.lock:
+            self.latest = max(self.latest, value)
+
+    def event(self, name, **headers):
+        request = urllib.request.Request(self.root + "/sim/clock", b"{}", {
+            "Content-Type": "application/json", "X-Sim-Event": name,
+            **{"X-Sim-" + key.replace("_", "-").title(): str(value) for key, value in headers.items()}})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+            return self.observe(response.headers)
+
+    def __enter__(self):
+        self.previous = clock.backend
+        clock.backend = self
+        return self
+
+    def __exit__(self, *exc):
+        clock.backend = self.previous
+
+    def begin_profile(self, lanes, control):
+        self.stage_control = control
+        self.event("profile", lanes=lanes)
+
+    def enter_lane(self, lane):
+        self.local.lane = lane
+
+    def pause_lane(self, lane):
+        self.event("pause", lane=lane)
+
+    def resume_lanes(self):
+        self.event("resume")
+
+    def headers(self):
+        """The lane and checkpoint of the calling thread's request, for its HTTP headers."""
+        lane = getattr(self.local, "lane", None)
+        if lane is None:
+            return {}
+        checkpoints = [getattr(self.local, "deadline", None)]
+        stage = getattr(self.stage_control, "deadline", None)
+        checkpoints.append(stage if stage is not None and stage > self.now + 1e-9 else None)
+        checkpoints = [c for c in checkpoints if c is not None]
+        return {"X-Sim-Lane": str(lane), **({"X-Sim-Checkpoint": repr(min(checkpoints))} if checkpoints else {})}
+
+    def invoke(self, control, operation, timeout, label):
+        control.check()
+        lane = getattr(self.local, "lane", None)
+        deadline = self.now + timeout if self.enforce_response_deadlines and timeout is not None else None
+        result = queue.Queue(maxsize=1)
+        def execute():
+            self.local.lane, self.local.deadline = lane, deadline
+            try:
+                result.put((True, operation()))
+            except BaseException as exc:
+                result.put((False, exc))
+        threading.Thread(target=execute, daemon=True, name="ripal-sim-http").start()
+        try:
+            while True:
+                try:
+                    ok, value = result.get(timeout=.02)
+                except queue.Empty:
+                    stopped = self.event("poll").get("X-Sim-Stopped")
+                    if stopped and lane is not None:
+                        # The server stopped its clock at a checkpoint: decide at that time, then let it go on.
+                        control.check()
+                        if deadline is not None and self.now >= deadline - 1e-9:
+                            raise ToolDeadlineExceeded(f"{label} exceeded the {timeout:g}s response deadline")
+                        self.event("ack", lane=lane, at=stopped)
+                    continue
+                if ok:
+                    return value
+                raise value
+        except BaseException:
+            if lane is not None:
+                self.event("cancel", lane=lane)
+            raise
 
 
 class ToolDeadlineExceeded(TimeoutError):
@@ -399,6 +525,8 @@ def read_stream(response, started, control=None, on_chunk=None):
         line = line.rstrip("\r\n")
         if line.startswith("data:"):
             data.append(line[5:].lstrip())
+        elif line.startswith(": clock=") and clock.virtual:
+            clock.backend.tick(float(line[8:]))
         elif not line and data:
             consume("\n".join(data))
             data = []
@@ -640,70 +768,10 @@ def floor_fit(pairs):
             "delay_seconds": statistics.median(seconds - fixed - slope * tokens for tokens, seconds in pairs)}
 
 
-# Warmup restarts at C=1. A first attempt whose requests all sit near one line ends warmup. Otherwise warmup starts
-# again from a fresh conversation, up to WARMUP_ATTEMPTS times, or until each probe task's two fastest attempts are
-# within AGREE_SHARE or AGREE_SECONDS of each other. Delays only add time, so each probe's fastest attempt is the best
-# estimate either way, and agreement shows it was not itself unusual. On hy4-flash-dev even undelayed requests varied
-# by about 30%, so agreement alone could take more attempts than it is worth.
-WARMUP_ATTEMPTS = 3
-CLEAN_R2 = .95
-CLEAN_SHARE, AGREE_SHARE, AGREE_SECONDS = .2, .15, .3
-
-
-def session_prefill(session):
-    """(task, fresh tokens, prefill seconds) of a session's answered requests."""
-    return [(request["task"], *pair) for request in session.get("requests", [])
-            if request.get("received_response") and not request.get("cancelled") and request.get("phase_timing")
-            for pair in [prefill_sample(request["phase_timing"])] if pair]
-
-
-def probe_times(session):
-    """{task: (fresh tokens, seconds)} of each probe task's largest request, the one after its read result. The first
-    warmup task carries no probe."""
-    largest = {}
-    for task, tokens, seconds in session_prefill(session):
-        if task > 1 and (task not in largest or tokens > largest[task][0]):
-            largest[task] = (tokens, seconds)
-    return largest
-
-
-def clean_attempt(session):
-    """Whether every request of a warmup attempt sits near one fixed + per-token line."""
-    pairs = [(tokens, seconds) for _, tokens, seconds in session_prefill(session)]
-    fit = prefill_fit(pairs)
-    if not fit or fit["p"] >= PREFILL_FIT_P or (fit["r2"] or 0) < CLEAN_R2:
-        return False
-    predicted = [(seconds, fit["fixed_seconds"] + tokens / fit["marginal_tokens_per_second"]) for tokens, seconds in pairs]
-    return all(seconds - guess <= max(AGREE_SECONDS, CLEAN_SHARE * guess) for seconds, guess in predicted)
-
-
-def fastest_probes(attempts):
-    """{task: [(fresh tokens, seconds), ...]}: each probe task's attempts, fastest first."""
-    times = {}
-    for session in attempts:
-        for task, pair in probe_times(session).items():
-            times.setdefault(task, []).append(pair)
-    return {task: sorted(pairs, key=lambda pair: pair[1]) for task, pairs in times.items()}
-
-
-def probes_agree(attempts):
-    """Whether every probe task's two fastest attempts are within AGREE_SHARE or AGREE_SECONDS of each other."""
-    probes = fastest_probes(attempts)
-    return bool(probes) and all(len(pairs) > 1 and pairs[1][1] - pairs[0][1] <= max(AGREE_SHARE * pairs[0][1], AGREE_SECONDS)
-                                for pairs in probes.values())
-
-
-def solo_warmup_attempts(report):
-    """Lane 1's C=1 warmup attempts, in order."""
-    return [session for run in report.get("warmup_runs", []) if run.get("lanes") == 1
-            for session in run["sessions"] if session.get("session", 0) == 0]
-
-
 def card_prefill_fit(report):
-    """The C=1 floor fit the card shows over every C=1 request, every warmup attempt included, and the number of C=1
-    warmup attempts."""
+    """The C=1 floor fit the card shows over every C=1 request, warmup included."""
     fit = floor_fit(solo_prefill_pairs(report))
-    return (fit if fit and fit["p"] < PREFILL_FIT_P else None), len(solo_warmup_attempts(report))
+    return fit if fit and fit["p"] < PREFILL_FIT_P else None
 
 
 def level_fixed_seconds(report, fit):
@@ -1385,8 +1453,29 @@ def match_label(quality):
     return f"{round(quality * 100, 1):g}% ({grade(quality)})"
 
 
+def probe_notes(report):
+    """The card's probe lines: the probe model of a C=1 request's first output, how long measured requests waited
+    beyond it at each level, and the idle cost before and after the benchmark."""
+    facts = (report.get("probe") or {}).get("facts") or {}
+    model = facts.get("model")
+    if not model:
+        return []
+    lines = [f"Probe (C=1 first output): {model_label(model, facts.get('task_depth'))}, fitted to the fastest of "
+             f"{model['points']} probe conditions."]
+    waits = request_waits(report, model)
+    if waits:
+        lines.append("Waits beyond it: " + " · ".join(
+            f"C={lanes} median {statistics.median(values):.2f}s, p90 {quantile(values, .9):.2f}s"
+            for lanes, values in sorted(waits.items())) + ".")
+    before, after = median(facts.get("idle_first_output") or []), median(facts.get("idle_after") or [])
+    if before is not None:
+        lines.append(f"Idle first output: {before:.2f}s before the benchmark"
+                     + (f", {after:.2f}s after." if after is not None else "."))
+    return lines
+
+
 def result_card(report, width=98):
-    fit, warmup_attempts = card_prefill_fit(report)
+    fit = card_prefill_fit(report)
     fixed = fit["fixed_seconds"] if fit else 0.0
     level_fixed = level_fixed_seconds(report, fit) if fit else {}
     summaries = sorted(report.get("summaries", {}).items(), key=lambda item: int(item[0]))
@@ -1531,8 +1620,6 @@ def result_card(report, width=98):
             add(f"C={lanes} time cap: {elapsed:.1f}s observed; {estimate}.")
         if summary.get("context_limited_sessions"):
             add(f"C={lanes} context limit: {summary['context_skipped_tasks']} tasks not started; scores use partial work.")
-    if warmup_attempts > 1:
-        add(f"Warmup ran {warmup_attempts} times at C=1 because its requests did not sit on one line.")
     if fit:
         p = "p < 0.01" if fit["p"] < 0.01 else f"p {fit['p']:.2f}"
         for line in textwrap.wrap(f"Prefill floor (C=1): {fit['marginal_tokens_per_second']:,.0f} t/s + "
@@ -1543,6 +1630,9 @@ def result_card(report, width=98):
         for line in textwrap.wrap("Fixed (s): what a request pays at any size, at most the C=1 fit's; the prefill rates "
                                   "leave it out.", width=width - 4):
             add(line)
+    for line in probe_notes(report):
+        for wrapped in textwrap.wrap(line, width=width - 4, subsequent_indent="  "):
+            add(wrapped)
     failures = api_error_counts([s for r in report.get("runs", []) for s in r["sessions"] + r.get("filler_sessions", [])])
     if failures:
         add("API errors: " + ", ".join(f"{kind}={count}" for kind, count in sorted(failures.items())))
@@ -1988,6 +2078,8 @@ def export_report(args, report, protocol, scoring_reference):
         'parameters': parameters, 'workload': report.get('config', {}),
         'context': report.get('model_context'), 'protocol': protocol,
         'scoring_reference': scoring_reference, 'timestamp_unit': 'Unix seconds (monotonic elapsed time)'}, 'events': [], 'runs': {}}
+    if report.get('probe'):
+        raw['probe'] = report['probe']
     if report.get('terminated') or report.get('interrupted'):
         raw['events'].append({'type': 'run_stopped', 'time': time.time(),
                               'kind': report.get('termination_kind'), 'reason': report.get('termination_reason')})
@@ -2260,250 +2352,9 @@ def session_diagnostics(raw, transform):
     return notes
 
 
-class VirtualClock:
-    def __init__(self, prefill, decode, response_timeouts=False, prefill_half_context=None, decode_half_context=None):
-        self.prefill, self.decode = prefill, decode
-        # Attention cost: a request's rate halves when its context reaches the half-context size.
-        self.prefill_half_context, self.decode_half_context = prefill_half_context, decode_half_context
-        self.enforce_response_deadlines = response_timeouts
-        self.now, self.epoch, self.serial = 0.0, real_time.time(), 0
-        self.local = threading.local()
-        self.condition = threading.Condition()
-        self.active = {0}
-        self.jobs = {}
-        self.stage_control = None
-        self.lanes = 1
-
-    def __enter__(self):
-        self.previous = clock.backend
-        clock.backend = self
-        return self
-
-    def __exit__(self, *exc):
-        clock.backend = self.previous
-
-    def begin_profile(self, lanes, control):
-        with self.condition:
-            self.lanes, self.active, self.stage_control = lanes, set(range(lanes)), control
-            self.condition.notify_all()
-
-    def enter_lane(self, lane):
-        self.local.lane = lane
-
-    def pause_lane(self, lane):
-        with self.condition:
-            self.active.discard(lane)
-            self.condition.notify_all()
-
-    def resume_lanes(self):
-        with self.condition:
-            self.active = set(range(self.lanes))
-            self.condition.notify_all()
-
-    def invoke(self, control, operation, timeout, label):
-        control.check()
-        previous = getattr(self.local, 'invocation', None)
-        self.local.invocation = (control, self.now + timeout if self.enforce_response_deadlines and timeout is not None else float('inf'), label, timeout)
-        try:
-            return operation()
-        finally:
-            self.local.invocation = previous
-
-    def submit(self, body, prompt, cached, arguments, on_chunk):
-        control, deadline, label, timeout = self.local.invocation
-        lane = getattr(self.local, 'lane', 0)
-        count = body['usage']['completion_tokens']
-        job = {'lane': lane, 'body': body, 'start': self.now, 'control': control, 'deadline': deadline, 'context': prompt,
-               'label': label, 'timeout': timeout, 'prefill': prompt - cached, 'phase': 'prefill',
-               'tokens': count, 'produced': 0, 'credit': 0.0, 'first': None, 'last': None,
-               'arguments': arguments, 'pending': '', 'on_chunk': on_chunk, 'done': False, 'error': None}
-        with self.condition:
-            self.jobs[lane] = job
-            self.condition.notify_all()
-            while not job['done']:
-                self._cancel()
-                if job['done']:
-                    break
-                if self.active.issubset(self.jobs):
-                    self._advance()
-                else:
-                    self.condition.wait()
-            if job['error']:
-                raise job['error']
-            return job['body']
-
-    def _cancel(self):
-        for lane, job in list(self.jobs.items()):
-            if job['control'].stopped:
-                job['error'] = RunCancelled(job['control'].reason)
-            elif self.now >= job['deadline'] - 1e-9:
-                job['error'] = ToolDeadlineExceeded(f"{job['label']} exceeded the {job['timeout']:g}s response deadline "
-                                                    "(virtual model)")
-            if job['error']:
-                job['done'] = True
-                del self.jobs[lane]
-                self.condition.notify_all()
-
-    def _chunk(self, job, data):
-        if job['on_chunk']:
-            job['on_chunk'](data if isinstance(data, str) else json.dumps(data), self.now)
-
-    def _advance(self):
-        if not self.jobs:
-            return
-        prefill = [j for j in self.jobs.values() if j['phase'] == 'prefill']
-        decode = [j for j in self.jobs.values() if j['phase'] == 'decode']
-        def rate(total, jobs, job, half):
-            return total / max(1, len(jobs)) / (1 + job['context'] / half if half else 1)
-        p = {j['lane']: rate(self.prefill, prefill, j, self.prefill_half_context) for j in prefill}
-        d = {j['lane']: rate(self.decode, decode, j, self.decode_half_context) for j in decode}
-        candidates = [max(0, j['prefill']) / p[j['lane']] for j in prefill]
-        candidates += [max(0, min(j['tokens'], ((j['produced'] - 1) // 32 + 1) * 32 + 1)
-                           - j['produced'] - j['credit']) / d[j['lane']] for j in decode]
-        candidates += [max(0, j['deadline'] - self.now) for j in self.jobs.values()]
-        if self.stage_control and self.stage_control.deadline and self.stage_control.deadline > self.now + 1e-9:
-            candidates.append(self.stage_control.deadline - self.now)
-        delta = min(candidates)
-        for job in prefill:
-            job['prefill'] -= p[job['lane']] * delta
-        for job in decode:
-            job['credit'] += d[job['lane']] * delta
-        self.now += delta
-        self._cancel()
-        for job in prefill:
-            if job['lane'] in self.jobs and job['prefill'] <= 1e-7:
-                job['phase'] = 'decode'
-                # Prefill produces logits for the first generated token. The
-                # remaining token intervals run at the configured decode rate.
-                self._emit_token(job)
-        for job in decode:
-            if job['lane'] not in self.jobs:
-                continue
-            while job['credit'] >= 1 - 1e-7 and job['produced'] < job['tokens']:
-                job['credit'] -= 1
-                self._emit_token(job)
-
-    def _emit_token(self, job):
-        n, total = job['produced'], job['tokens']
-        text = job['arguments'][len(job['arguments']) * n // total:len(job['arguments']) * (n + 1) // total]
-        job['pending'] += text
-        if n == 0:
-            job['first'] = self.now
-        job['last'] = self.now
-        job['produced'] += 1
-        if n == 0 or n % 32 == 0 or job['produced'] == job['tokens']:
-            function = {'arguments': job['pending']}
-            call = {'index': 0, 'function': function}
-            if n == 0:
-                function['name'] = job['body']['choices'][0]['message']['tool_calls'][0]['function']['name']
-                call.update(id=job['body']['choices'][0]['message']['tool_calls'][0]['id'], type='function')
-            self._chunk(job, {'choices': [{'index': 0, 'delta': {'tool_calls': [call]}}]})
-            job['pending'] = ''
-        if job['produced'] == job['tokens']:
-            job['body']['_stream_timing'] = {'source': 'virtual model streaming observations',
-                'first_output_seconds': job['first'] - job['start'],
-                'generation_seconds': job['last'] - job['first'], 'response_seconds': self.now - job['start']}
-            self._chunk(job, {'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})
-            self._chunk(job, {'choices': [], 'usage': job['body']['usage']})
-            self._chunk(job, '[DONE]')
-            job['done'] = True
-            del self.jobs[job['lane']]
-            self.condition.notify_all()
-
-
-
-class VirtualModel:
-    supports_stream_cancel = True
-    supports_telemetry = True
-
-    def __init__(self, runtime, tools, transform, context_window=262144, cache_block=8192, kv_tokens=None):
-        self.virtual_clock, self.tools, self.transform = runtime, tools, transform
-        self.context_window, self.cache_block = context_window, cache_block
-        # Total prefix-cache capacity shared by all lanes; None is unlimited.
-        self.kv_tokens = kv_tokens
-        self.extra, self.cache_policy, self.streaming, self.timeout = {}, 'server-default', True, 60
-        self.previous_prompts = {}
-        self.message_units = {}
-        self.base_units = weighted_words(json.dumps({"messages": [], "tools": tools}, ensure_ascii=False))
-        self.request_counter = 0
-        self.lock = threading.Lock()
-
-    def discover_context_limit(self):
-        return {'limit': self.context_window, 'source': 'virtual model'}
-
-    def count_prompt_tokens(self, messages):
-        units = self.base_units + .25 * max(0, len(messages) - 1)
-        for message in messages:
-            calls = tuple((call.get('id'), call.get('type'), (call.get('function') or {}).get('name'),
-                           (call.get('function') or {}).get('arguments')) for call in message.get('tool_calls') or [])
-            key = (tuple(sorted(message)), message.get('role'), message.get('content'),
-                   message.get('tool_call_id'), message.get('reasoning_content'), calls)
-            cached = self.message_units.get(key)
-            if cached is None:
-                cached = weighted_words(json.dumps(message, ensure_ascii=False))
-                self.message_units[key] = cached
-            units += cached
-        return math.ceil(units)
-
-    def complete(self, messages, stage, config, cancel_control=None, on_chunk=None):
-        target = None
-        for message in messages:
-            if message['role'] == 'user' and message.get('content', '').startswith(('Start with task ID ', 'Continue with task ID ')):
-                target = message['content'].split()[-1].rstrip('.')
-            elif message['role'] == 'tool':
-                result = json.loads(message['content'])
-                if result.get('next_task_id'):
-                    target = result['next_task_id']
-        if stage == 'auto':
-            # A perfect agent: the next tool follows from the last tool result, unless the harness moved it on to a
-            # new task after that result.
-            latest = next((m for m in reversed(messages) if m['role'] == 'tool' or (
-                m['role'] == 'user' and m.get('content', '').startswith('Continue with task ID '))), {'role': 'user'})
-            last = json.loads(latest['content']) if latest['role'] == 'tool' else {}
-            stage = ('submit_result' if 'submit_key' in last else 'read_file' if 'path' in last else 'search_records')
-        if stage == 'search_records':
-            args = {'id': target}
-        elif stage == 'read_file':
-            found = next(json.loads(m['content']) for m in reversed(messages)
-                         if m['role'] == 'tool' and 'path' in json.loads(m['content']))
-            args = {'path': found['path']}
-        else:
-            found = next(json.loads(m['content']) for m in reversed(messages)
-                         if m['role'] == 'tool' and 'contents' in json.loads(m['content']))
-            record = next(json.loads(line) for line in found['contents'].splitlines() if json.loads(line)['id'] == target)
-            args = {'id': target, 'revision': record['revision'], 'text': self.transform(record['payload'], found['transformation'])}
-            if 'submit_key' in found:
-                args['key'] = found['submit_key']
-        arguments = json.dumps(args, ensure_ascii=False)
-        prompt = self.count_prompt_tokens(messages)
-        key = messages[1]['content']
-        with self.lock:
-            previous = self.previous_prompts.pop(key, 0)
-            cached = min(prompt, max(0, previous - 4) // self.cache_block * self.cache_block)
-            # Insertion order is recency order: evict the least recently used other lanes.
-            self.previous_prompts[key] = prompt
-            while self.kv_tokens and sum(self.previous_prompts.values()) > self.kv_tokens and len(self.previous_prompts) > 1:
-                del self.previous_prompts[next(iter(self.previous_prompts))]
-            self.request_counter += 1
-            call_id = f'virtual-{self.request_counter}'
-        if self.cache_policy == 'disabled':
-            cached = 0
-        body = {'choices': [{'finish_reason': 'tool_calls', 'message': {'role': 'assistant', 'content': None,
-                 'tool_calls': [{'id': call_id, 'type': 'function', 'function': {'name': stage, 'arguments': arguments}}]}}],
-                'usage': {'prompt_tokens': prompt, 'completion_tokens': max(1, math.ceil(weighted_words(arguments))),
-                          'prompt_tokens_details': {'cached_tokens': cached}}}
-        response = self.virtual_clock.submit(body, prompt, cached, arguments, on_chunk if self.streaming else None)
-        if not self.streaming:
-            response.pop('_stream_timing', None)
-        return response
-
-
-VERSION = "ripal-v18"
+VERSION = "ripal-v19"
 # Seeds task generation. v16 balances the target record's position (target_position), so its tasks differ from v13's.
-# v17 moved half the seeded history into warmup prefill probes (probe_words) as random filler words. v18 makes the
-# probes distractor records (hy4-flash-dev pasted record JSON into its answer after 3,809 filler words), and keeps
-# v16's measured tasks and conversation size, so the score of a server matches v16's. The warmup differs, so v18 runs
-# only resume v18 runs.
+# v19 measures the same workload as v16 and adds the optional probe, so only v19 runs resume v19 runs.
 WORKLOAD_VERSION = "ripal-v16"
 # Protocols that sent temperature 0 in every request without recording it.
 OLD_TEMPERATURE_ZERO = {"ripal-v11", "ripal-v12", "ripal-v13"}
@@ -2715,16 +2566,6 @@ def resize_task(task, config, words):
             payload = [mixed_case(word, rng) for word in payload]
         records.append({"id": record_id, "revision": revision, "payload": " ".join(payload)})
     target = records[target_index]
-    if task.get("probe_words"):
-        # A probe adds full-size distractor records, then shuffles the file, so the target can sit anywhere in it. Its
-        # records stay lowercase whatever the transformation: mixed case cost hy4-flash-dev about twice the tokens a
-        # word, and the probe's tokens should match the history words it replaces.
-        probe = random.Random(f"{task['record_seed']}:probe:{task.get('probe_nonce', '')}")
-        for _ in range(math.ceil(task["probe_words"] / words)):
-            payload = probe.choices(vocabulary, k=words)
-            records.append({"id": f"record-{probe.getrandbits(64):016x}", "revision": probe.randrange(1, 1000),
-                            "payload": " ".join(payload)})
-        probe.shuffle(records)
     task.update(target=target, words=words, contents="\n".join(json.dumps(record) for record in records))
     return task
 
@@ -2742,74 +2583,6 @@ def make_session(config, session, task_offset=0):
                     WORDS, k=config.filler_words))}
         tasks.append(resize_task(task, config, config.words))
     return tasks
-
-
-# Warmup prefill probes. The warmup tasks after the first add distractor records to their files, in sizes that grow
-# PROBE_GROWTH times a step, so the C=1 prefill fit sees fresh tokens from hundreds to tens of thousands. The probe
-# words come out of the seeded history, so measured tasks run at the same context.
-PROBE_SHARE = .5
-PROBE_GROWTH = 4
-
-
-# v16 warmed up with 2 plain tasks. Measured tasks keep the seeds and positions they had after those 2, whatever
-# --warmup-tasks is set to, and the history gives up the words the larger warmup adds, so a server's score matches v16's.
-BASELINE_WARMUPS = 2
-
-
-def task_weighted_words(task):
-    """Weighted words a completed task adds to a conversation: its three tool calls and their results."""
-    target = task["target"]
-    calls = [({"id": target["id"]}, {"path": task["path"]}),
-             ({"path": task["path"]}, {"contents": task["contents"], "read_padding": task["read_padding"],
-                                       "transformation": task["transformation"], **read_instructions(task["transformation"])}),
-             ({"id": target["id"], "revision": target["revision"],
-               "text": transform(target["payload"], task["transformation"])}, {"ok": True})]
-    return sum(weighted_words(json.dumps(arguments)) + weighted_words(json.dumps(result)) for arguments, result in calls)
-
-
-def warmup_workload(config, session, warmup_tasks, probes):
-    """A lane's tasks, and the weighted words its warmup adds beyond v16's BASELINE_WARMUPS plain tasks. The first
-    BASELINE_WARMUPS warmups and every measured task are v16's. Extra warmups come from their own seed."""
-    plain = make_session(replace(config, tasks=BASELINE_WARMUPS + config.tasks), session)
-    seed = int.from_bytes(hashlib.sha256(f"{config.seed}:extra-warmups".encode()).digest()[:8], "big")
-    extra = make_session(replace(config, seed=seed, tasks=max(0, warmup_tasks - BASELINE_WARMUPS)), session,
-                         task_offset=BASELINE_WARMUPS)
-    warmups = (plain[:BASELINE_WARMUPS] + extra)[:warmup_tasks]
-    # A shorter warmup than v16's gives the missing words back to the history.
-    added = (sum(task_weighted_words(task) for task in warmups[BASELINE_WARMUPS:])
-             - sum(task_weighted_words(task) for task in plain[warmup_tasks:BASELINE_WARMUPS]))
-    for task, words in zip(warmups, probes):
-        if words:
-            before = weighted_words(json.dumps({"contents": task["contents"]}))
-            sized = resize_task({**task, "probe_words": words}, config, config.words)
-            added += weighted_words(json.dumps({"contents": sized["contents"]})) - before
-            task["probe_words"] = words
-    return warmups + plain[BASELINE_WARMUPS:], added
-
-
-def matched_history_words(config, added):
-    """The history budget whose whole tasks come closest to v16's history less `added` weighted words. history_messages
-    adds whole tasks until it reaches its budget, so subtracting from the budget alone would change its overshoot."""
-    if not added or not config.history_words:
-        return config.history_words
-    full = history_messages(replace(config, history_words=config.history_words + abs(added) + 4096), 0)
-    totals, words, tasks = [], 0.0, 0
-    for message in full:
-        words += weighted_words(json.dumps(message))
-        if message["role"] == "tool" and '"ok": true' in message["content"]:
-            totals.append(words)
-    baseline = next((total for total in totals if total >= config.history_words), totals[-1])
-    best = min(totals, key=lambda total: abs(total - (baseline - added)))
-    # history_messages stops at the first task whose running total reaches the budget.
-    return max(1, int(best) - 1)
-
-
-def probe_words(history_words, warmup_tasks):
-    """Payload words of probe distractor records for each warmup task. The first task prefills the history, so it gets
-    none."""
-    weights = [0] + [PROBE_GROWTH ** ((index - 1) % 3) for index in range(1, warmup_tasks)]
-    total, budget = sum(weights), int(history_words * PROBE_SHARE)
-    return [budget * weight // total if total else 0 for weight in weights]
 
 
 def history_messages(config, session):
@@ -3022,8 +2795,13 @@ class Client:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        simulated = clock.simulated
+        if simulated:
+            headers.update(simulated.headers())
         request = urllib.request.Request(url, json.dumps(body).encode() if body is not None else None, headers)
         with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+            if simulated:
+                simulated.observe(response.headers)
             return json.load(response)
 
     def discover_context_limit(self):
@@ -3063,14 +2841,20 @@ class Client:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
+        simulated = clock.simulated
+        if simulated:
+            headers.update(simulated.headers())
         request = urllib.request.Request(self.url, json.dumps(body).encode(), headers)
         started = time.perf_counter()
         control = cancel_control or getattr(self, "control", None)
         if control:
             control.check()
-        socket_timeout = max(self.timeout, config.deadline or 0) if self.streaming else (
+        # A simulated server keeps simulated time, so its deadlines travel as checkpoints and the socket waits freely.
+        socket_timeout = None if simulated else max(self.timeout, config.deadline or 0) if self.streaming else (
             config.deadline or response_deadline(self, config.words, stage))
         with urllib.request.urlopen(request, timeout=socket_timeout) as response:
+            if simulated:
+                simulated.observe(response.headers)
             with control.watch_response(response) if control else nullcontext():
                 if "text/event-stream" in getattr(response, "headers", {}).get("Content-Type", ""):
                     return read_stream(response, started, control, on_chunk)
@@ -3127,9 +2911,6 @@ def run_session(client, config, tasks, session, state=None):
                 control.check()
             task_ok, aborted = True, False
             dependency_ok, quality_credit, transform_score, edit = True, 0.0, None, None
-            if task.get("probe_words"):
-                # Fresh probe records each attempt, so no earlier attempt or run's prefix cache holds them.
-                task["probe_nonce"] = os.urandom(8).hex()
             resize_task(task, config, config.words)
             target = task["target"]
             words = task["words"]
@@ -3157,7 +2938,6 @@ def run_session(client, config, tasks, session, state=None):
                 mix_control.input_words += sum(weighted_words(m.get("content")) for m in (messages[0], messages[-1]))
             padding_words = mix_control.plan(expected, index + 1)
             padding = " ".join(random.Random(task["padding_seed"]).choices(WORDS, k=padding_words))
-            probe = task.get("probe_words", 0)
             expected[1][2]["read_padding"] = padding
             task_config = replace(config, words=words, max_tokens=max(config.max_tokens, len(expected_text.encode()) + 256))
             extra = getattr(client, "extra", {})
@@ -3192,8 +2972,6 @@ def run_session(client, config, tasks, session, state=None):
                     if history_prefill and deadline is not None:
                         # The lane's first request prefills the whole history.
                         deadline += state.get("history_deadline_seconds", 0)
-                    if probe and deadline is not None:
-                        deadline += state.get("prefill_seconds_per_word", 0) * probe
                     entry["deadline_seconds"] = deadline
                     calls += 1
                     request_id = f"{sid}:request:{calls}"
@@ -3497,8 +3275,6 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
     measurement_started_at = None
     warmup_started_at = time.perf_counter()
     warmup_sessions = []
-    # Every warmup attempt, in order. warmup_sessions holds each lane's last attempt. The measured run continues it.
-    all_warmups = []
     time_budget = {}
     stage_control = StageControl(client.control, lanes)
     virtual = getattr(client, "virtual_clock", None)
@@ -3536,28 +3312,14 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             virtual.enter_lane(index)
         barrier.wait()
         # Lanes prefill their histories together, so each gets a share of the prefill floor.
-        per_word = HISTORY_TOKENS_PER_WORD * lanes / (stage_prefill_rate or 1000)
-        fresh_state = lambda: {"history_deadline_seconds": per_word * config.history_words, "prefill_seconds_per_word": per_word}
-        state = fresh_state()
+        state = {"history_deadline_seconds": HISTORY_TOKENS_PER_WORD * config.history_words * lanes
+                 / (stage_prefill_rate or 1000)}
         if warmup_tasks:
             warm_config = replace(config, tasks=warmup_tasks, filler=False)
             warm_client = PhaseClient(stage_client, "warmup")
-            probed = lanes == 1 and any(task.get("probe_words") for task in tasks[:warmup_tasks])
-            attempts = []
-            while True:
-                warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
-                attempts.append(warm)
-                finished_cleanly = not (warm["error"] or warm["interrupted"] or warm["context_limited"]
-                                        or stop_requested(client))
-                if (not probed or not finished_cleanly or len(attempts) >= WARMUP_ATTEMPTS or clean_attempt(warm)
-                        or (len(attempts) > 1 and probes_agree(attempts))):
-                    break
-                emit(client, f"Warmup probes at C=1 disagree after attempt {len(attempts)}; starting warmup again "
-                             f"from a fresh conversation ({len(attempts) + 1} of {WARMUP_ATTEMPTS})")
-                state = fresh_state()
+            warm = run_session(warm_client, warm_config, tasks[:warmup_tasks], index, state=state)
             with lock:
                 warmup_sessions.append(warm)
-                all_warmups.extend(attempts)
         if virtual:
             virtual.pause_lane(index)
         measurement_barrier.wait()
@@ -3576,9 +3338,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             while not finished.is_set() and not stage_control.stopped and not stage_control.expired:
                 seed = int.from_bytes(hashlib.sha256(f"{config.seed}:filler:{index}:{sequence}".encode()).digest()[:8], "big")
                 filler_config = replace(config, seed=seed, tasks=1, filler=False, filler_words=padding, words=filler_words)
-                # Filler tasks follow the measured ones at the offsets they had after v16's warmup.
-                offset = BASELINE_WARMUPS + len(tasks) - warmup_tasks + sequence
-                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=offset), index, state=state)
+                item = run_session(filler_client, filler_config, make_session(filler_config, index, task_offset=len(tasks) + sequence), index, state=state)
                 item.update({"filler": True, "seed": seed})
                 filler_words = item["next_words"]
                 if item["mix_adjustments"]:
@@ -3646,7 +3406,7 @@ def run_profile(client, config, workload, lanes, warmup_tasks=0, stage_prefill_r
             "effective_sessions": credit, "sessions": sessions, "completed_words": completed_words, "estimated_planned_words": forecast_words, "token_mix": observed_mix,
             "primary_token_mix": primary_mix, "filler_sessions": filler_sessions,
             "word_mix": combine_word_mix(s["word_mix"] for s in sessions + filler_sessions),
-            "warmup_sessions": all_warmups, "warmup_seconds": warmup_seconds,
+            "warmup_sessions": warmup_sessions, "warmup_seconds": warmup_seconds,
             "has_measurements": any(s["requests"] for s in sessions),
             "filler_completed_tasks": sum(s["load_completed_tasks"] for s in filler_sessions),
             "filler_cancelled_requests": sum(s["cancelled_requests"] for s in filler_sessions),
@@ -3857,36 +3617,1135 @@ def positive(value):
     return number
 
 
+# The probe's stages, in order. Each tests one part of a server with small, targeted requests.
+PROBE_STAGES = [("api", "API baseline"), ("idle", "Idle baseline"), ("prefill", "Prefill curve"),
+                ("cache", "Prefix cache"), ("decode", "Decode"), ("concurrency", "Concurrency")]
+PROBE_SCHEMA = "ripal-probe-v1"
+PROBE_MARKS = {"ok": ("✓", CREAM), "warn": ("!", AMBER), "fail": ("✗", WARNING), "info": ("·", MUTED),
+               "running": ("▸", ORANGE), "pending": ("○", MUTED), "skipped": ("–", MUTED)}
+
+
+class ProbeState:
+    """What the probe has found so far: each stage's status and checks, and the facts later stages build on."""
+    def __init__(self, model, endpoint):
+        self.model, self.endpoint = model, endpoint
+        self.stages = {key: {"status": "pending", "checks": [], "planned": [], "tests": [], "result": None}
+                       for key, _ in PROBE_STAGES}
+        self.stages["api"]["planned"] = list(API_CHECKS)
+        self.levels = []
+        self.facts = {}
+        self.current = None
+
+    def summary(self, key):
+        """What a stage's checks found: their warnings and failures, or "all passed"."""
+        counts = Counter(check["status"] for check in self.stages[key]["checks"])
+        parts = [f"{counts[s]} {'warning' if s == 'warn' else 'failed'}{'s' if s == 'warn' and counts[s] != 1 else ''}"
+                 for s in ("warn", "fail") if counts[s]]
+        return " · ".join(parts) or "all passed"
+
+
+def probe_grid(stage, inner):
+    """A stage's planned checks as two columns of cells, filled down the left column first. A cell is a checkbox, the
+    check's name and its result in one line. Checks not yet run are faded."""
+    done = {check["name"]: check for check in stage["checks"]}
+    planned = stage.get("planned") or list(done)
+    nxt = next((name for name in planned if name not in done), None) if stage["status"] == "running" else None
+    gap, cell = 2, (inner - 2) // 2
+    def segments(name):
+        check = done.get(name)
+        if check:
+            mark, color = PROBE_MARKS[check["status"]]
+            return [(f"{mark} ", color), (f"{name[:20]:<21}", CREAM), (check["result"][:cell - 23], AMBER)]
+        state = "running" if name == nxt else "skipped" if stage["status"] == "done" else "pending"
+        mark, color = PROBE_MARKS[state]
+        return [(f"{mark} ", color), (f"{name[:20]:<21}", CREAM if state == "running" else MUTED),
+                ("skipped" if state == "skipped" else "", MUTED)]
+    half = (len(planned) + 1) // 2
+    rows = []
+    for index in range(half):
+        left = segments(planned[index])
+        width = sum(len(text) for text, _ in left)
+        row = left + [(" " * (cell - width + gap), MUTED)]
+        if index + half < len(planned):
+            row += segments(planned[index + half])
+        rows.append(row)
+    return rows
+
+
+BAR_WIDTH = 16
+
+
+def progress_bar(done, total, width=BAR_WIDTH):
+    filled = round(width * done / total) if total else 0
+    return "█" * filled + "░" * (width - filled)
+
+
+def stage_tests(stage, key):
+    """A timing stage's tests: the ones it has run, then the ones it still plans."""
+    tests = list(stage["tests"])
+    if stage["status"] != "done":
+        tests += [{"name": name, "done": 0, "total": total, "result": "", "status": "pending"}
+                  for name, total in stage["planned"][len(tests):]]
+    return tests
+
+
+def stage_progress(state, key):
+    """(steps done, steps planned) of a stage: checks, test steps or concurrency requests."""
+    stage = state.stages[key]
+    if stage["status"] == "skipped":
+        return 0, 0
+    if key == "api":
+        return len(stage["checks"]), len(stage["planned"])
+    if key == "concurrency":
+        table = stage.get("table") or [{"done": 0, "total": 2 * c} for c in state.levels]
+        return sum(row["done"] for row in table), sum(row["total"] for row in table)
+    tests = stage_tests(stage, key)
+    return sum(t["done"] for t in tests), sum(t["total"] for t in tests)
+
+
+def probe_tests(stage, key, inner):
+    """A timing stage's tests and their results; the ones not yet run are faded."""
+    rows = []
+    for test in stage_tests(stage, key):
+        pending = test["status"] == "pending"
+        rows.append([(f"  {test['name'][:21]:<22}", MUTED if pending else CREAM), (test["result"][:inner - 24], AMBER)])
+    return rows
+
+
+def probe_table(state, inner):
+    """The concurrency levels: decode and prefill as totals with the per-lane rate in brackets, the median time to
+    first output, and errors. A level still running shows its progress."""
+    rows = [[(f"  {'C':<4}{'Decode (t/s)':<22}{'Prefill (t/s)':<22}{'First output':<15}Errors", MUTED)]]
+    table = state.stages["concurrency"].get("table") or [{"lanes": c, "done": 0, "total": 2 * c} for c in state.levels]
+    for row in table:
+        lanes = row["lanes"]
+        if "errors" in row:
+            decode = f"{row['decode'] * lanes:,.1f} ({row['decode']:,.1f})" if row.get("decode") else "—"
+            prefill = f"{row['prefill'] * lanes:,.0f} ({row['prefill']:,.0f})" if row.get("prefill") else "—"
+            rows.append([(f"  {lanes:<4}", CREAM), (f"{decode:<22}{prefill:<22}"
+                                                   f"{seconds_label(row.get('first_output')):<15}{row['errors']}", AMBER)])
+        else:
+            rows.append([(f"  {lanes:<4}", CREAM if row["done"] else MUTED),
+                         (f"{row['done']} of {row['total']} requests" if row["done"] else "", MUTED)])
+    return rows
+
+
+def probe_rows(state, width):
+    """The probe view as rows of (text, colour) segments, in the card's shape."""
+    inner = width - 4
+    title = f"RealMark Probe  ·  {state.model}  ·  {state.endpoint}"
+    if len(title) <= inner:
+        rows = [[(title, "1;" + CREAM)]]
+    else:
+        # A long endpoint, such as the simulator's arguments, wraps onto lines of its own.
+        rows = [[(f"RealMark Probe  ·  {state.model}"[:inner], "1;" + CREAM)]]
+        rows += [[(line, CREAM)] for line in textwrap.wrap(state.endpoint, inner - 2, initial_indent="  ",
+                                                            subsequent_indent="  ", break_on_hyphens=False)]
+    if state.current:
+        rows.append([(f"Probing: {dict(PROBE_STAGES)[state.current]}", AMBER)])
+    else:
+        found = [f"{name}: {state.summary(key)}" for key, name in PROBE_STAGES if state.stages[key]["checks"]]
+        rows.append([("; ".join(found) or "Nothing probed yet", AMBER)])
+        model = state.facts.get("model")
+        if model:
+            rows.append([(f"First output (C=1): {model_label(model, state.facts.get('task_depth'))}"[:inner], AMBER)])
+    rows += [[], [("Stage", MUTED)]]
+    for key, name in PROBE_STAGES:
+        stage = state.stages[key]
+        status = stage["status"]
+        mark, color = PROBE_MARKS["warn" if status == "done" and any(c["status"] in ("warn", "fail") for c in stage["checks"])
+                                  else "ok" if status == "done" else status]
+        if key == "api":
+            note = state.summary(key) if status == "done" else ""
+        else:
+            note = stage["result"] or ""
+        done, total = stage_progress(state, key)
+        bar_tone = MUTED if status == "pending" else ORANGE if status == "running" else CREAM
+        rows.append([(f"{mark} ", color), (f"{name:<16}", CREAM if status != "pending" else MUTED),
+                     (progress_bar(done, total), bar_tone), (f" {done:>3}/{total:<3}  ", MUTED),
+                     (note[:inner - 44], AMBER if status == "done" else MUTED)])
+    if state.stages["concurrency"]["status"] in ("pending", "skipped"):
+        rows += [[], [("API baseline", "1;" + CREAM)]] + probe_grid(state.stages["api"], inner)
+    else:
+        # Once concurrency starts, its table takes the API grid's place. The stage list keeps the API summary.
+        rows += [[], [("Concurrency", "1;" + CREAM)]] + probe_table(state, inner)
+    for key, name in PROBE_STAGES:
+        if key not in ("api", "concurrency"):
+            rows += [[], [(name, "1;" + CREAM)]] + probe_tests(state.stages[key], key, inner)
+    return rows
+
+
+def probe_card(state, width=98, color=False):
+    """The probe view, framed like the result card. With color, uses the card's palette."""
+    inner = width - 4
+    border = f"\x1b[0;{BACKGROUND};{WHITE}m" if color else ""
+    reset = "\x1b[0m" if color else ""
+    lines = [f"{border}╭{'─' * (width - 2)}╮{reset}"]
+    for row in probe_rows(state, width):
+        text = "".join(segment for segment, _ in row)[:inner]
+        pad = " " * (inner - len(text))
+        if color:
+            used, body = 0, ""
+            for segment, tone in row:
+                segment = segment[:max(0, inner - used)]
+                used += len(segment)
+                body += f"\x1b[0;{BACKGROUND};{tone}m{segment}"
+            lines.append(f"{border}│ {body}\x1b[0;{BACKGROUND}m{pad} {border}│{reset}")
+        else:
+            lines.append(f"│ {text}{pad} │")
+    lines.append(f"{border}╰{'─' * (width - 2)}╯{reset}")
+    return "\n".join(lines)
+
+
+class ProbeView:
+    """Shows the probe live in a terminal, redrawing the card as checks finish, or as one line a check otherwise."""
+    def __init__(self, state, mode="auto", color="auto", stream=None):
+        self.state, self.stream = state, stream if stream is not None else sys.stdout
+        tty = self.stream.isatty()
+        self.live = mode == "live" or (mode == "auto" and tty and os.environ.get("TERM") != "dumb")
+        self.color = color == "always" or (color == "auto" and tty and "NO_COLOR" not in os.environ)
+        self.lock = threading.Lock()
+
+    def update(self, check=None):
+        with self.lock:
+            if self.live:
+                self.stream.write("\x1b[H\x1b[J" + probe_card(self.state, color=self.color) + "\n")
+            elif check:
+                detail = f" ({check['detail']})" if check["detail"] != check["result"] else ""
+                self.stream.write(f"{PROBE_MARKS[check['status']][0]} {check['name']}: {check['result']}{detail}\n")
+            self.stream.flush()
+
+    def line(self, text):
+        """A line of plain output, for a finished test or stage. The live view shows it in the card."""
+        if text and not self.live:
+            with self.lock:
+                self.stream.write(text + "\n")
+                self.stream.flush()
+
+    def finish(self):
+        with self.lock:
+            if self.live:
+                self.stream.write("\x1b[H\x1b[J")
+            self.stream.write(probe_card(self.state, color=self.color) + "\n")
+            self.stream.flush()
+
+
+class ProbeClient:
+    """Sends the probe's requests: any body, streamed or not, outside the benchmark's task conversation."""
+    # Errors a server often recovers from: a probe request retries them a few times before it counts as failed.
+    TRANSIENT = {429, 500, 502, 503, 504}
+    ATTEMPTS = 3
+
+    def __init__(self, client):
+        self.client = client
+        self.root = client.base_url[:-3] if client.base_url.endswith("/v1") else client.base_url
+        self.retries = Counter()
+
+    def _headers(self):
+        headers = {"Content-Type": "application/json"}
+        if self.client.api_key:
+            headers["Authorization"] = f"Bearer {self.client.api_key}"
+        return headers
+
+    def get(self, path):
+        """(status, body) of GET base_url + path; status is None when the server cannot be reached."""
+        request = urllib.request.Request(self.client.base_url + path, headers=self._headers())
+        return self._send(request)
+
+    def post(self, url, body):
+        request = urllib.request.Request(url, json.dumps(body).encode(), self._headers())
+        return self._send(request)
+
+    def _send(self, request, stream=False):
+        for attempt in range(self.ATTEMPTS):
+            result = self._attempt(request, stream)
+            if result[0] not in self.TRANSIENT or attempt == self.ATTEMPTS - 1:
+                return result
+            self.retries[result[0]] += 1
+            real_time.sleep(.5 * (attempt + 1))
+        return result
+
+    def _attempt(self, request, stream):
+        try:
+            with urllib.request.urlopen(request, timeout=max(60, self.client.timeout)) as response:
+                if clock.virtual:
+                    clock.backend.observe(response.headers)
+                if stream and "text/event-stream" in response.headers.get("Content-Type", ""):
+                    events = []
+                    body = read_stream(response, time.perf_counter(), None, lambda payload, at: events.append(payload))
+                    return response.status, body, events
+                body = json.load(response)
+                return (response.status, body, None) if stream else (response.status, body)
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", "replace")[:300]
+            return (exc.code, text, None) if stream else (exc.code, text)
+        except (URLError, OSError, ValueError) as exc:
+            return (None, f"{type(exc).__name__}: {exc}", None) if stream else (None, f"{type(exc).__name__}: {exc}")
+
+    def chat(self, messages, stream=False, **fields):
+        """(status, body, stream events) of one chat request with the client's --extra-body."""
+        body = {"max_tokens": 1024, **self.client.extra, "model": self.client.model, "messages": messages,
+                "stream": stream, **fields}
+        if stream:
+            body["stream_options"] = {"include_usage": True}
+        request = urllib.request.Request(self.client.url, json.dumps(body).encode(), self._headers())
+        return self._send(request, stream=True)
+
+
+def reply_parts(body):
+    """(message, finish_reason, usage) of a chat response body, with empty values when it has none."""
+    choices = body.get("choices") if isinstance(body, dict) else None
+    choice = choices[0] if choices else {}
+    return choice.get("message") or {}, choice.get("finish_reason"), (body.get("usage") if isinstance(body, dict) else None) or {}
+
+
+def reasoning_of(message, usage):
+    """Tokens and characters of a reply's thinking, and the field it came in."""
+    tokens = ((usage.get("completion_tokens_details") or {}).get("reasoning_tokens")) or 0
+    for field in ("reasoning_content", "reasoning"):
+        if message.get(field):
+            return tokens, len(message[field]), field
+    return tokens, 0, None
+
+
+def tool_call_of(message):
+    """(name, parsed arguments or None, raw arguments) of a reply's first tool call, or None."""
+    calls = message.get("tool_calls") or []
+    if not calls:
+        return None
+    function = calls[0].get("function") or {}
+    raw = function.get("arguments") or ""
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        parsed = None
+    return function.get("name"), parsed, raw
+
+
+PROBE_WORD_TOOL = {"type": "function", "function": {"name": "report_word", "description": "Report one word.",
+                   "parameters": {"type": "object", "properties": {"word": {"type": "string"}}, "required": ["word"]}}}
+PROBE_RECORD_TOOL = {"type": "function", "function": {
+    "name": "report_record", "description": "Report a record's id and revision.",
+    "parameters": {"type": "object", "properties": {"id": {"type": "string"}, "revision": {"type": "integer"}},
+                   "required": ["id", "revision"]}}}
+
+
+# The API baseline's checks, in the order they run and fill the grid.
+API_CHECKS = ["Models", "Tokenize", "Chat", "Usage", "Brief reply", "Thinking", "Streaming", "Server timings",
+              "Tool call (auto)", "Forced tool choice", "Parallel tool calls", "Record lookup", "Tokenizer cost",
+              "Transient errors"]
+
+
+def http_label(status):
+    return f"HTTP {status}" if status else "unreachable"
+
+
+def probe_api(probe, state, record):
+    """The API baseline: what the server's API supports, how it reports usage and thinking, and how the model handles
+    plain replies, tool calls and a record lookup. `record(name, status, short, detail)` adds a check: a result that
+    fits one grid cell, and the full finding for the saved results and plain output."""
+    facts = state.facts
+    ok_reply = [{"role": "user", "content": "Reply with exactly OK and nothing else."}]
+
+    status, body = probe.get("/models")
+    if status != 200 or not isinstance(body, dict):
+        record("Models", "fail", http_label(status), str(body)[:160])
+    else:
+        ids = [m.get("id") for m in body.get("data") or []]
+        entry = next((m for m in body.get("data") or [] if m.get("id") == probe.client.model), None)
+        field = next((f for f in ("max_model_len", "context_length", "max_context_length", "context_window")
+                      if entry and isinstance(entry.get(f), int) and entry[f] > 0), None)
+        facts["context_limit"] = entry[field] if field else None
+        if entry is None:
+            record("Models", "warn", "model not listed", f"{probe.client.model} not listed; found "
+                   + ", ".join(map(str, ids[:5])))
+        elif field:
+            record("Models", "ok", f"{entry[field]:,} tokens", f"context {entry[field]:,} from {field}")
+        else:
+            record("Models", "warn", "no context limit", "no context limit; RealMark needs --context-window")
+
+    status, body = probe.post(probe.root + "/tokenize", {"model": probe.client.model, "messages": ok_reply,
+                                                         "add_generation_prompt": True})
+    count = body.get("count", len(body.get("tokens") or [])) if isinstance(body, dict) else 0
+    facts["tokenize"] = status == 200 and count > 0
+    if facts["tokenize"]:
+        record("Tokenize", "ok", "works", f"{count} tokens for the OK prompt")
+    else:
+        record("Tokenize", "warn", http_label(status), "RealMark counts context from prompt_tokens instead")
+
+    status, body, _ = probe.chat(ok_reply)
+    message, finish, usage = reply_parts(body)
+    if status != 200 or not message:
+        record("Chat", "fail", http_label(status), str(body)[:160])
+        record_retries(probe, facts, record)
+        return
+    if finish == "length":
+        record("Chat", "warn", "ran to max_tokens", "a two-letter reply ran on to max_tokens")
+    else:
+        record("Chat", "ok", "works", f"finish_reason {finish}")
+    fields = [f for f, present in (("prompt_tokens", "prompt_tokens" in usage),
+                                   ("completion_tokens", "completion_tokens" in usage),
+                                   ("cached_tokens", "cached_tokens" in (usage.get("prompt_tokens_details") or {})),
+                                   ("reasoning_tokens", "reasoning_tokens" in (usage.get("completion_tokens_details") or {})))
+              if present]
+    facts["cached_tokens_reported"] = "cached_tokens" in fields
+    missing = [f for f in ("prompt_tokens", "completion_tokens", "cached_tokens") if f not in fields]
+    record("Usage", "warn" if missing else "ok", f"no {missing[0]}" if missing else "all fields",
+           "reports " + (", ".join(fields) or "nothing") + (f"; missing {', '.join(missing)}" if missing else ""))
+
+    thinking, chars, field = reasoning_of(message, usage)
+    facts["thinks_by_default"] = bool(thinking or chars)
+    facts["reasoning_field"] = field
+    text = (message.get("content") or "").strip()
+    answer_tokens = (usage.get("completion_tokens") or 0) - thinking
+    brief = text.strip(" .!\"'").upper() == "OK" and answer_tokens <= 4
+    tokens = f"{answer_tokens} token{'s' if answer_tokens != 1 else ''}"
+    record("Brief reply", "ok" if brief else "warn", tokens if brief else f"{text[:8]!r}, {tokens}",
+           f"{text[:60]!r} in {tokens}" if text else "no text")
+    if facts["thinks_by_default"]:
+        amount = f"{thinking:,} tokens" if thinking else f"{chars:,} characters"
+        record("Thinking", "warn", amount, f"{amount} by default, in {field}")
+    else:
+        record("Thinking", "ok", "none", "none by default")
+
+    status, body, events = probe.chat(ok_reply, stream=True)
+    if status != 200 or events is None:
+        record("Streaming", "fail", http_label(status), str(body)[:160])
+    else:
+        susage = reply_parts(body)[2]
+        parsed = [json.loads(e) for e in events if e != "[DONE]"]
+        facts["stream_usage"] = bool(susage)
+        record("Streaming", "ok" if susage else "warn", "with usage" if susage else "no usage",
+               f"{len(parsed)} events" + ("" if susage else "; RealMark needs usage at the end of a stream"))
+        standard = {"id", "object", "created", "model", "choices", "usage", "system_fingerprint", "service_tier"}
+        extras = sorted({key for event in parsed for key in event if key not in standard})
+        facts["server_fields"] = extras
+        record("Server timings", "info", ", ".join(extras) or "none", ", ".join(extras) or "no extra fields")
+
+    status, body, _ = probe.chat([{"role": "user", "content": "Call report_word with the word amber."}],
+                                 tools=[PROBE_WORD_TOOL], tool_choice="auto")
+    message, finish, _ = reply_parts(body)
+    call = tool_call_of(message)
+    if status != 200:
+        record("Tool call (auto)", "fail", http_label(status), str(body)[:160])
+    elif finish == "length":
+        record("Tool call (auto)", "warn", "ran to max_tokens", (call[2] if call else message.get("content") or "")[:160])
+    elif not call:
+        record("Tool call (auto)", "warn", "text reply", "replied in text instead of calling the tool")
+    elif call[1] is None:
+        record("Tool call (auto)", "warn", "invalid JSON", call[2][:160])
+    else:
+        record("Tool call (auto)", "ok", "valid call", f"{call[0]}({json.dumps(call[1])})")
+
+    status, body, _ = probe.chat(ok_reply, tools=[PROBE_WORD_TOOL],
+                                 tool_choice={"type": "function", "function": {"name": "report_word"}})
+    call = tool_call_of(reply_parts(body)[0])
+    facts["forced_tool_choice"] = status == 200 and bool(call)
+    if facts["forced_tool_choice"]:
+        record("Forced tool choice", "ok", "honoured", "the reply called the forced tool")
+    elif status in (400, 422):
+        record("Forced tool choice", "warn", f"rejected ({status})", "--forced-tool-choice true will not work")
+    elif status == 200:
+        record("Forced tool choice", "warn", "ignored", "the reply did not call the forced tool")
+    else:
+        record("Forced tool choice", "warn", http_label(status), "a server error, so support is unknown")
+
+    status, body, _ = probe.chat([{"role": "user", "content": "Call report_word with the word birch."}],
+                                 tools=[PROBE_WORD_TOOL], tool_choice="auto", parallel_tool_calls=False)
+    facts["parallel_tool_calls"] = status == 200 if status in (200, 400, 422) else None
+    if status == 200:
+        record("Parallel tool calls", "ok", "accepted", "parallel_tool_calls: false accepted")
+    elif status in (400, 422):
+        record("Parallel tool calls", "warn", f"rejected ({status})", "RealMark sends parallel_tool_calls: false")
+    else:
+        record("Parallel tool calls", "warn", http_label(status), "a server error, so support is unknown")
+
+    rng = random.Random("probe:lookup")
+    records = [{"id": f"record-{rng.getrandbits(64):016x}", "revision": rng.randrange(1, 1000),
+                "payload": " ".join(rng.choices(WORDS, k=24))} for _ in range(12)]
+    target = records[rng.randrange(3, 9)]
+    prompt = (f"Find {target['id']} in the file below. Call report_record with its id and revision, and nothing "
+              "else.\n" + "\n".join(json.dumps(r) for r in records))
+    status, body, _ = probe.chat([{"role": "user", "content": prompt}], tools=[PROBE_RECORD_TOOL], tool_choice="auto")
+    message, finish, _ = reply_parts(body)
+    call = tool_call_of(message)
+    if status == 200 and finish == "length":
+        record("Record lookup", "warn", "ran to max_tokens",
+               ((call[2] if call else "") or message.get("content") or "")[:160])
+    elif status != 200 or not call or call[1] is None:
+        record("Record lookup", "warn", "no valid call" if status == 200 else http_label(status),
+               (message.get("content") or "")[:160] if status == 200 else str(body)[:160])
+    else:
+        right = call[1].get("id") == target["id"] and call[1].get("revision") == target["revision"]
+        issues = [n for n, bad in (("pasted the record", len(call[2]) > 200 or '"payload"' in call[2]),
+                                   ("added text", bool((message.get("content") or "").strip()))) if bad]
+        short = ("right record" if right else "wrong record") + (" + " + issues[0] if issues else "")
+        record("Record lookup", "ok" if right and not issues else "warn", short,
+               ("found 1 of 12 records by ID" if right else f"asked for {target['id']}, got {call[1].get('id')}")
+               + (f"; {' and '.join(issues)}" if issues else ""))
+
+    costs = {}
+    for name, text in probe_token_samples().items():
+        counted = probe_tokens(probe, facts, text)
+        if counted is None:
+            break
+        costs[name] = counted / weighted_words(text)
+    facts["tokens_per_word"] = costs
+    if costs:
+        record("Tokenizer cost", "info", f"{costs['plain words']:.2f}–{max(costs.values()):.2f} tokens/word",
+               "tokens/word: " + " · ".join(f"{name} {value:.2f}" for name, value in costs.items()))
+    else:
+        record("Tokenizer cost", "warn", "not measured", "neither /tokenize nor prompt_tokens answered")
+
+    record_retries(probe, facts, record)
+
+
+def record_retries(probe, facts, record):
+    """Adds the Transient errors check: how many probe requests needed a retry, and for which HTTP codes."""
+    facts["transient_errors"] = dict(probe.retries)
+    if probe.retries:
+        record("Transient errors", "warn", f"{sum(probe.retries.values())} retried",
+               ", ".join(f"HTTP {code} ×{count}" for code, count in sorted(probe.retries.items())))
+    else:
+        record("Transient errors", "ok", "none", "no request needed a retry")
+
+
+def probe_token_samples():
+    """RealMark's kinds of text, about 64 weighted words each."""
+    rng = random.Random("probe:tokens")
+    words = rng.choices(WORDS, k=64)
+    plain = " ".join(words)
+    return {"plain words": plain, "pig latin": transform(plain, "pig_latin"),
+            "reversed": transform(plain, "reverse_words"), "no vowels": transform(plain, "remove_vowels"),
+            "mixed case": " ".join(mixed_case(word, rng) for word in words),
+            "hex IDs": " ".join(f"record-{rng.getrandbits(64):016x}" for _ in range(16)),
+            "JSON record": json.dumps({"id": f"record-{rng.getrandbits(64):016x}", "revision": 42,
+                                       "payload": " ".join(words[:40])})}
+
+
+def probe_tokens(probe, facts, text):
+    """Tokens `text` adds to a one-message prompt: from /tokenize, else from usage.prompt_tokens."""
+    def count(content):
+        messages = [{"role": "user", "content": content}]
+        if facts.get("tokenize"):
+            status, body = probe.post(probe.root + "/tokenize", {"model": probe.client.model, "messages": messages,
+                                                                 "add_generation_prompt": True})
+            return (body.get("count", len(body.get("tokens") or [])) if status == 200 and isinstance(body, dict)
+                    else None)
+        status, body, _ = probe.chat(messages, max_tokens=1)
+        return reply_parts(body)[2].get("prompt_tokens") if status == 200 else None
+    full, empty = count(text), count("")
+    return full - empty if full is not None and empty is not None else None
+
+
+def probe_timed(probe, messages, lane=0, **fields):
+    """One timed, streamed chat request: its first-output time, decode rate and token counts. On a simulator on
+    simulated time it runs on `lane`, and times come from the simulator's clock. Transient errors retry."""
+    sim = clock.simulated
+    body = {"max_tokens": 1024, **probe.client.extra, "model": probe.client.model, "messages": messages,
+            "stream": True, "stream_options": {"include_usage": True}, **fields}
+    for attempt in range(probe.ATTEMPTS):
+        headers = probe._headers()
+        if sim:
+            sim.local.lane, sim.local.stream = lane, None
+            headers.update(sim.headers())
+        request = urllib.request.Request(probe.client.url, json.dumps(body).encode(), headers)
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=None if sim else max(300, probe.client.timeout)) as response:
+                if sim:
+                    sim.observe(response.headers)
+                    started = float(response.headers.get("X-Sim-Clock") or started)
+                result = read_stream(response, started)
+            finished = time.perf_counter()
+        except HTTPError as exc:
+            if exc.code in probe.TRANSIENT and attempt < probe.ATTEMPTS - 1:
+                probe.retries[exc.code] += 1
+                real_time.sleep(.5 * (attempt + 1))
+                continue
+            return {"status": exc.code, "error": f"HTTP {exc.code}"}
+        except (URLError, OSError, ValueError) as exc:
+            return {"status": None, "error": f"{type(exc).__name__}: {exc}"}
+        tokens = request_tokens(result)
+        timing = phase_timing(result, tokens) or {}
+        message, finish, usage = reply_parts(result)
+        return {"status": 200, "first_output": timing.get("first_output_seconds"), "total": finished - started,
+                "prompt": tokens.get("prompt_tokens"), "cached": tokens.get("cached_tokens"),
+                # Without cached_tokens, a fresh probe prompt counts as all fresh.
+                "fresh": tokens.get("fresh_tokens", tokens.get("prompt_tokens")), "completion": tokens.get("output_tokens"),
+                "decode_seconds": timing.get("generation_seconds"), "decode_tokens": timing.get("decode_tokens"),
+                "chunks": timing.get("visible_chunks"), "bursts": timing.get("bursts"),
+                "buffered": bool(timing.get("buffered")), "finish": finish,
+                "thinking": reasoning_of(message, usage)[0]}
+    return {"status": None, "error": "no attempt"}
+
+
+def probe_text(probe, state, tokens, seed):
+    """About `tokens` tokens of RealMark's vocabulary, sized by the tokens per word the API baseline measured."""
+    per_word = (state.facts.get("tokens_per_word") or {}).get("plain words") or 1.3
+    rng = random.Random(seed)
+    return " ".join(rng.choices(WORDS, k=max(1, round(tokens / per_word))))
+
+
+def probe_prefix(probe, state, tokens, label):
+    """A system message of about `tokens` tokens that no earlier request shares: a fresh prefix for the cache."""
+    nonce = f"{label}-{os.urandom(6).hex()}"
+    return {"role": "system", "content": f"Session {nonce}. Reference text follows.\n"
+            + probe_text(probe, state, tokens, nonce)}
+
+
+def probe_size_cap(state, share=.25, ceiling=65536):
+    """The largest prompt a probe sends: a share of the context limit, at most `ceiling` tokens."""
+    limit = state.facts.get("context_limit")
+    return min(ceiling, int(limit * share)) if limit else min(ceiling, 32768)
+
+
+def ok_question(nonce=""):
+    return {"role": "user", "content": f"Reply with exactly OK and nothing else. {nonce}".strip()}
+
+
+def long_answer(words):
+    return {"role": "user", "content": f"Write exactly {words} words of plain prose about a river valley. "
+                                       "No title, no lists, no formatting."}
+
+
+def median(values):
+    values = [v for v in values if v is not None]
+    return statistics.median(values) if values else None
+
+
+def seconds_label(value):
+    return "—" if value is None else f"{value:.2f}s"
+
+
+IDLE_REQUESTS, DRIFT_REQUESTS, PROBE_REPEATS = 16, 6, 3
+SHALLOW_SIZES = (2048, 16384)
+DEPTH_SIZES = (512, 2048, 8192, 32768)
+# Restore depths as shares of the task depth. The last restores the task conversation itself.
+RESTORE_SHARES = ((1, 8), (1, 2), (1, 1))
+
+
+def probe_idle(probe, state, test, count=IDLE_REQUESTS, name="Tiny requests", key="idle_first_output"):
+    """Tiny uncached requests one after another: what a request costs when nothing else runs."""
+    run = test(name, count)
+    times = []
+    for index in range(count):
+        result = probe_timed(probe, [probe_prefix(probe, state, 16, f"{key}{index}"), ok_question()], max_tokens=16)
+        times.append(result.get("first_output"))
+        run.step(f"median {seconds_label(median(times))}")
+    times = sorted(t for t in times if t is not None)
+    state.facts[key] = times
+    p90 = times[int(.9 * (len(times) - 1))] if times else None
+    run.finish(f"median {seconds_label(median(times))} · p90 {seconds_label(p90)}")
+    return f"{seconds_label(median(times))} to first output"
+
+
+def task_prefix(probe, state, config, label):
+    """The benchmark's system prompt and a lane's seeded history, behind a nonce so no benchmark lane shares its
+    cache. Without a history, a 16K-token system message stands in."""
+    if not config.history_words:
+        return [probe_prefix(probe, state, 16384, label)]
+    nonce = f"{label}-{os.urandom(6).hex()}"
+    return [{"role": "system", "content": f"Session {nonce}.\n{SYSTEM}"}] + history_messages(config, 0)
+
+
+def side_question(probe, state, tokens, label):
+    """A user turn of about `tokens` fresh tokens that no other request shares."""
+    nonce = f"{label}-{os.urandom(6).hex()}"
+    return {"role": "user", "content": f"{nonce} {probe_text(probe, state, tokens, nonce)} Reply with exactly OK."}
+
+
+def probe_condition(state, name, results, expected_cached):
+    """Saves one probe condition: its requests' token counts and first-output times. Without cached_tokens, the
+    cached count is the prefix the condition primed."""
+    good = [r for r in results if r.get("status") == 200 and r.get("first_output") is not None and r.get("prompt")]
+    if not good:
+        return None
+    reported = [r["cached"] for r in good if r.get("cached") is not None]
+    prompt = round(median([r["prompt"] for r in good]))
+    cached = round(median(reported)) if reported else min(expected_cached, prompt)
+    condition = {"name": name, "prompt": prompt, "cached": cached, "fresh": prompt - cached,
+                 "cached_reported": bool(reported), "times": [r["first_output"] for r in good]}
+    state.facts.setdefault("conditions", []).append(condition)
+    return condition
+
+
+def timed_repeats(probe, run, make, repeats=PROBE_REPEATS, **fields):
+    results = []
+    for repeat in range(repeats):
+        results.append(probe_timed(probe, make(repeat), max_tokens=16, **fields))
+        run.step(seconds_label(min((r["first_output"] for r in results if r.get("first_output") is not None),
+                                   default=None)))
+    return results
+
+
+def probe_prefill(probe, state, test, config):
+    """Fresh prompts of growing size, first alone and then after the task conversation, primed once and cached, so
+    the fresh tokens' cost is measured at the depth the benchmark runs at."""
+    limit = state.facts.get("context_limit") or 131072
+    shallow = {}
+    for size in SHALLOW_SIZES:
+        run = test(f"Shallow {size // 1024}K", PROBE_REPEATS)
+        if size + 2048 > limit:
+            run.finish("skipped: context limit")
+            continue
+        results = timed_repeats(probe, run, lambda r: [probe_prefix(probe, state, size, f"shallow{size}-{r}"), ok_question()])
+        condition = probe_condition(state, f"shallow {size}", results, 0)
+        if condition:
+            shallow[size] = condition
+            run.finish(f"{condition['fresh']:,} fresh · fastest {seconds_label(min(condition['times']))}")
+        else:
+            run.finish("no timing")
+    run = test("Prime task depth", 1)
+    prefix = task_prefix(probe, state, config, "depth")
+    tools = {"tools": TOOLS} if config.history_words else {}
+    prime = probe_timed(probe, prefix + [ok_question("prime")], max_tokens=16, **tools)
+    depth = prime.get("prompt")
+    state.facts["task_depth"] = depth
+    run.step()
+    run.finish(f"{depth:,} tokens · {seconds_label(prime.get('first_output'))}" if depth else
+               f"failed: {prime.get('error') or 'no usage'}")
+    rates = []
+    for size in DEPTH_SIZES:
+        label = f"{size // 1024}K" if size >= 1024 else str(size)
+        run = test(f"Depth + {label}", PROBE_REPEATS)
+        if not depth or depth + size + 2048 > limit:
+            run.finish("skipped: context limit" if depth else "skipped: no prime")
+            continue
+        results = timed_repeats(probe, run, lambda r: prefix + [side_question(probe, state, size, f"side{size}-{r}")],
+                                **tools)
+        condition = probe_condition(state, f"depth + {size}", results, depth)
+        if condition:
+            run.finish(f"{condition['cached']:,} cached + {condition['fresh']:,} fresh · fastest "
+                       f"{seconds_label(min(condition['times']))}")
+        else:
+            run.finish("no timing")
+    state.facts["depth_prefix"] = len(prefix)
+    if not depth:
+        return "no task-depth prime"
+    return f"task depth {depth:,} tokens"
+
+
+def probe_cache(probe, state, test, config, block_test):
+    """What restoring a cached prefix costs at three depths, the last the task conversation. The first hit on the
+    deepest prefix is the repeat-hit check. Without a benchmark after it, also the cache's block size."""
+    facts = state.facts
+    depth = facts.get("task_depth") or 16384
+    restore = []
+    for share, whole in RESTORE_SHARES:
+        name = "Restore task depth" if share == whole else f"Restore {share}/{whole} depth"
+        run = test(name, PROBE_REPEATS + 1)
+        tools = {}
+        if share == whole:
+            prefix = task_prefix(probe, state, config, "restore")
+            tools = {"tools": TOOLS} if config.history_words else {}
+        else:
+            prefix = [probe_prefix(probe, state, depth * share // whole, f"restore{share}-{whole}")]
+        prime = probe_timed(probe, prefix + [ok_question("prime")], max_tokens=16, **tools)
+        run.step(f"{prime.get('prompt') or 0:,} primed")
+        results = timed_repeats(probe, run, lambda r: prefix + [ok_question(f"hit {r}")], **tools)
+        condition = probe_condition(state, name.lower(), results, prime.get("prompt") or 0)
+        if not condition:
+            run.finish("no timing")
+            continue
+        restore.append(condition)
+        run.finish(f"{condition['cached']:,} of {condition['prompt']:,} cached · fastest "
+                   f"{seconds_label(min(condition['times']))}")
+        if share == whole:
+            first = results[0]
+            facts["cache_hit"] = {"prompt": first.get("prompt"), "cached": first.get("cached")}
+    facts["cache_restore"] = restore
+    block = probe_block_size(probe, state, test) if block_test else None
+    hit = facts.get("cache_hit") or {}
+    if hit.get("cached") is None:
+        found = "cached_tokens not reported"
+    elif not hit["cached"]:
+        found = "no cache hits seen"
+    else:
+        found = f"{hit['cached'] / max(1, hit['prompt']):.0%} of the task conversation hit"
+    return found + (f" · {block:,}-token blocks" if block else "")
+
+
+def probe_block_size(probe, state, test):
+    """A conversation growing past at least one block boundary: cache hits land on block multiples, and their
+    greatest common divisor is the block. 16K tokens plus 6 steps of 1,800 crosses an 8K block's boundary at 24,576."""
+    run = test("Block size", 6)
+    messages = [probe_prefix(probe, state, min(16384, probe_size_cap(state)), "block")]
+    cached = []
+    for step in range(6):
+        messages = messages + [{"role": "user", "content": probe_text(probe, state, 1800, f"block{step}")
+                                + " Reply with exactly OK."}]
+        result = probe_timed(probe, messages, max_tokens=16)
+        if result.get("cached"):
+            cached.append(result["cached"])
+        messages = messages + [{"role": "assistant", "content": "OK"}]
+        run.step(f"{len(cached)} hits")
+    block = 0
+    for value in cached:
+        block = math.gcd(block, value)
+    measured = block if block and len(set(cached)) >= 2 else None
+    state.facts["cache_block"] = measured
+    run.finish(f"{block:,} tokens" if measured else "no hits to measure" if not cached
+               else f"at most {cached[0]:,} tokens")
+    return measured
+
+
+def probe_decode(probe, state, test, deep):
+    """A long answer at shallow context, and without a benchmark after it, at 32K and how the stream arrives."""
+    results = {}
+    cases = [("Shallow context", 256)]
+    if deep:
+        size = min(32768, probe_size_cap(state))
+        cases.append((f"{size // 1024}K context", size))
+    for name, size in cases:
+        run = test(name, 2)
+        prefix = probe_prefix(probe, state, size, f"decode{size}")
+        rates = []
+        for repeat in range(2):
+            result = probe_timed(probe, [prefix, long_answer(300)], max_tokens=1024)
+            results.setdefault(name, []).append(result)
+            if result.get("decode_seconds"):
+                rates.append(result["decode_tokens"] / result["decode_seconds"])
+            run.step(f"{median(rates):,.1f} t/s" if rates else "—")
+        run.finish(f"{median(rates):,.1f} t/s" if rates else "no decode timing")
+    every = [r for group in results.values() for r in group if r.get("status") == 200]
+    state.facts["decode"] = {name: [{k: r.get(k) for k in ("completion", "decode_seconds", "decode_tokens", "chunks",
+                                                            "bursts", "buffered")} for r in group]
+                             for name, group in results.items()}
+    if deep:
+        buffered = sum(r["buffered"] for r in every)
+        per_chunk = median([r["completion"] / r["chunks"] for r in every if r.get("chunks") and r.get("completion")])
+        run = test("Stream shape", 1)
+        run.finish(f"{buffered} of {len(every)} buffered" if buffered else
+                   f"{per_chunk:.1f} tokens a chunk" if per_chunk else "no stream")
+    rates = [r["decode_tokens"] / r["decode_seconds"] for r in every if r.get("decode_seconds")]
+    return f"{median(rates):,.1f} t/s per stream" if rates else "no decode timing"
+
+
+# The probe model's terms: a fixed cost, a cost per cached token restored, a cost per fresh token, and how much each
+# fresh token's cost grows with the cached tokens before it.
+MODEL_TERMS = ("fixed", "cached", "fresh", "fresh_cached")
+
+
+def model_row(cached, fresh):
+    return (1.0, cached, fresh, fresh * cached)
+
+
+def solve(matrix, vector):
+    """x with matrix · x = vector, by Gaussian elimination with partial pivoting; None when singular."""
+    size = len(vector)
+    rows = [list(matrix[i]) + [vector[i]] for i in range(size)]
+    for col in range(size):
+        pivot = max(range(col, size), key=lambda r: abs(rows[r][col]))
+        if abs(rows[pivot][col]) < 1e-300:
+            return None
+        rows[col], rows[pivot] = rows[pivot], rows[col]
+        for r in range(size):
+            if r != col:
+                factor = rows[r][col] / rows[col][col]
+                rows[r] = [a - factor * b for a, b in zip(rows[r], rows[col])]
+    return [rows[i][size] / rows[i][i] for i in range(size)]
+
+
+def expected_min_delay(excess, count):
+    """The expected least of `count` draws from the delays in `excess`, by order statistics of the sample."""
+    values, size = sorted(excess), len(excess)
+    return sum(value * (((size - k) / size) ** count - ((size - k - 1) / size) ** count)
+               for k, value in enumerate(values)) if values else 0.0
+
+
+def fit_probe_model(conditions, idle=None):
+    """The probe model, first output = fixed + a·cached + b·fresh + c·fresh·cached, fitted by least squares on relative
+    error to the fastest request of each condition. Delays only add time, so the fastest is the closest to the
+    server's own cost. It still carries the least of its repeats' delays, so the idle requests' spread above their
+    fastest gives each condition's expected least delay to take off. A term that comes out negative, or within two
+    standard errors of zero, is left out. None with too few conditions."""
+    excess = [t - min(idle) for t in idle] if idle else []
+    points = [(c["cached"], c["fresh"], min(c["times"]) - expected_min_delay(excess, len(c["times"])))
+              for c in conditions if c.get("times")]
+    if idle:
+        points.append((0, 0, min(idle)))
+    active = list(range(len(MODEL_TERMS)))
+    while len(points) > len(active) and active:
+        # Columns scale to about 1, so the normal equations stay well conditioned.
+        scale = [max(abs(model_row(c, f)[i]) for c, f, _ in points) or 1 for i in active]
+        rows = [[model_row(c, f)[i] / s for i, s in zip(active, scale)] for c, f, _ in points]
+        weights = [1 / max(seconds, .05) ** 2 for _, _, seconds in points]
+        size = len(active)
+        matrix = [[sum(w * row[i] * row[j] for w, row in zip(weights, rows)) for j in range(size)] for i in range(size)]
+        vector = [sum(w * row[i] * seconds for w, row, (_, _, seconds) in zip(weights, rows, points)) for i in range(size)]
+        solution = solve(matrix, vector)
+        if solution is None:
+            return None
+        residuals = [seconds - sum(v * x for v, x in zip(solution, row)) for row, (_, _, seconds) in zip(rows, points)]
+        variance = sum(w * r * r for w, r in zip(weights, residuals)) / (len(points) - size)
+        errors = [math.sqrt(max(0.0, variance * (solve(matrix, [float(i == j) for j in range(size)]) or [0] * size)[i]))
+                  for i in range(size)]
+        # The fixed cost always stays. Of the others, the weakest goes first.
+        weakest = min(range(1, size), key=lambda i: solution[i] / errors[i] if errors[i] else math.inf, default=None)
+        if weakest is not None and (solution[weakest] < 0 or (errors[weakest] and solution[weakest] < 2 * errors[weakest])):
+            del active[weakest]
+            continue
+        model = dict.fromkeys(MODEL_TERMS, 0.0)
+        model.update({MODEL_TERMS[i]: value / s for i, value, s in zip(active, solution, scale)})
+        model.update(points=len(points), delay_correction=expected_min_delay(excess, PROBE_REPEATS))
+        return model
+    return None
+
+
+def predict_first_output(model, cached, fresh):
+    return sum(model[term] * value for term, value in zip(MODEL_TERMS, model_row(cached, fresh)))
+
+
+def request_waits(report, model):
+    """{lanes: [seconds]}: how long each measured request's first output came after the probe model's prediction for
+    its cached and fresh tokens. Buffered replies give no first-output time, so they are left out."""
+    waits = {}
+    for run in report.get("runs", []):
+        for session in run.get("sessions", []):
+            for request in session.get("requests", []):
+                timing, tokens = request.get("phase_timing") or {}, request.get("tokens") or {}
+                first, prompt, fresh = timing.get("first_output_seconds"), tokens.get("prompt_tokens"), tokens.get("fresh_tokens")
+                if (not request.get("received_response") or request.get("cancelled") or timing.get("buffered")
+                        or first is None or prompt is None or fresh is None):
+                    continue
+                waits.setdefault(run["lanes"], []).append(first - predict_first_output(model, prompt - fresh, fresh))
+    return waits
+
+
+def quantile(values, share):
+    values = sorted(values)
+    return values[int(share * (len(values) - 1))] if values else None
+
+
+def probe_concurrency(probe, state, levels, update):
+    """Each level runs its lanes at once, two requests a lane: totals and per-lane rates, first output and errors."""
+    sim = clock.simulated
+    fresh = min(2048, probe_size_cap(state))
+    table = state.stages["concurrency"]["table"] = [{"lanes": c, "done": 0, "total": 2 * c} for c in levels]
+    for row in table:
+        lanes = row["lanes"]
+        results, lock = [], threading.Lock()
+        if sim:
+            sim.begin_profile(lanes, None)
+        def lane_work(lane):
+            for repeat in range(2):
+                result = probe_timed(probe, [probe_prefix(probe, state, fresh, f"c{lanes}-{lane}-{repeat}"),
+                                             long_answer(150)], lane=lane, max_tokens=512)
+                with lock:
+                    results.append(result)
+                    row["done"] += 1
+                update()
+            if sim:
+                sim.pause_lane(lane)
+        threads = [threading.Thread(target=lane_work, args=(lane,), daemon=True) for lane in range(lanes)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        good = [r for r in results if r.get("status") == 200]
+        decode = median([r["decode_tokens"] / r["decode_seconds"] for r in good if r.get("decode_seconds")])
+        # As on the result card, prefill leaves out what a request pays at any size: the prefill floor's fixed cost.
+        fixed = (state.facts.get("prefill_fit") or {}).get("fixed_seconds", 0.0)
+        prefill = median([r["fresh"] / max(r["first_output"] - fixed, 1e-3) for r in good
+                          if r.get("fresh") and r.get("first_output")])
+        row.update(decode=decode, prefill=prefill, first_output=median([r.get("first_output") for r in good]),
+                   errors=len(results) - len(good))
+        update()
+    state.facts["concurrency"] = table
+    best = max((row for row in table if row.get("decode")), default=None,
+               key=lambda r: (round(r["decode"] * r["lanes"]), -r["lanes"]))
+    return f"{best['decode'] * best['lanes']:,.0f} t/s decode at C={best['lanes']}" if best else "no timing"
+
+def model_label(model, depth=None):
+    """The probe model in words: its fixed cost and the rates its per-token terms come to."""
+    parts = [f"{model['fixed']:.2f}s"]
+    if model["fresh"]:
+        rate = f"fresh at {1 / model['fresh']:,.0f} t/s"
+        if model["fresh_cached"] and depth:
+            rate += f" ({1 / (model['fresh'] + model['fresh_cached'] * depth):,.0f} at {depth / 1000:.0f}K deep)"
+        parts.append(rate)
+    if model["cached"]:
+        parts.append(f"cached at {1 / model['cached']:,.0f} t/s")
+    return " + ".join(parts)
+
+
+class ProbeTest:
+    """One test's progress bar in a stage."""
+    def __init__(self, stage, name, total, update):
+        self.row = {"name": name, "done": 0, "total": total, "result": "", "status": "running"}
+        stage["tests"].append(self.row)
+        self.update = update
+        update()
+
+    def step(self, result=""):
+        self.row["done"] = min(self.row["total"], self.row["done"] + 1)
+        self.row["result"] = result
+        self.update()
+
+    def finish(self, result):
+        self.row.update(done=self.row["total"], result=result, status="done")
+        self.update()
+
+
+def probe_plan(benchmark):
+    """Each timing stage's tests as (name, steps), drawn as faded bars until the stage runs them. A benchmark after the
+    probe measures deep decode, the stream's shape, the cache's block size and concurrency itself."""
+    depth = [(f"Depth + {size // 1024}K" if size >= 1024 else f"Depth + {size}", PROBE_REPEATS) for size in DEPTH_SIZES]
+    restore = [("Restore task depth" if share == whole else f"Restore {share}/{whole} depth", PROBE_REPEATS + 1)
+               for share, whole in RESTORE_SHARES]
+    return {"idle": [("Tiny requests", IDLE_REQUESTS)],
+            "prefill": [(f"Shallow {size // 1024}K", PROBE_REPEATS) for size in SHALLOW_SIZES]
+                       + [("Prime task depth", 1)] + depth,
+            "cache": restore + ([] if benchmark else [("Block size", 6)]),
+            "decode": [("Shallow context", 2)] + ([] if benchmark else [("32K context", 2), ("Stream shape", 1)])}
+
+
+def run_probe(args, client, config, output=None):
+    """Runs the probe's stages. With `output`, saves what it found there, and with none, a benchmark follows and
+    keeps it. Returns (1 when the server cannot chat, so a benchmark after it would fail too, else 0; what it found)."""
+    benchmark = output is None
+    endpoint = f"simulator {args.simulator}".strip() if args.simulator is not None else args.base_url
+    state = ProbeState(args.model, endpoint)
+    state.levels = list(args.lanes)
+    for key, tests in probe_plan(benchmark).items():
+        state.stages[key]["planned"] = tests
+    view = ProbeView(state, args.ui, args.color)
+    probe = ProbeClient(client)
+    sim = clock.simulated
+    view.update()
+    timed = {"idle": lambda test: probe_idle(probe, state, test),
+             "prefill": lambda test: probe_prefill(probe, state, test, config),
+             "cache": lambda test: probe_cache(probe, state, test, config, not benchmark),
+             "decode": lambda test: probe_decode(probe, state, test, not benchmark)}
+    for key, name in PROBE_STAGES:
+        stage = state.stages[key]
+        if key == "concurrency" and benchmark:
+            stage.update(status="skipped", result="the benchmark measures it")
+            continue
+        state.current, stage["status"] = key, "running"
+        view.update()
+        if key == "api":
+            def record(check_name, status, result, detail=None):
+                check = {"name": check_name, "status": status, "result": result, "detail": detail or result}
+                stage["checks"].append(check)
+                view.update(check)
+            probe_api(probe, state, record)
+            if any(c["name"] == "Chat" and c["status"] == "fail" for c in stage["checks"]):
+                # Without a working chat endpoint, the timing stages have nothing to time.
+                stage["status"] = "done"
+                break
+        elif key == "concurrency":
+            stage["result"] = probe_concurrency(probe, state, state.levels, view.update)
+        else:
+            if sim:
+                sim.begin_profile(1, None)
+            def test(test_name, total, stage=stage, name=name):
+                run = ProbeTest(stage, test_name, total, view.update)
+                finish = run.finish
+                def finished(result):
+                    finish(result)
+                    view.line(f"{name} · {test_name}: {result}")
+                run.finish = finished
+                return run
+            stage["result"] = timed[key](test)
+        stage["status"] = "done"
+        view.line(f"{name}: {stage['result']}" if key != "api" else None)
+        if key == "cache":
+            state.facts["model"] = fit_probe_model(state.facts.get("conditions", []), state.facts.get("idle_first_output"))
+    state.current = None
+    if sim:
+        # The benchmark names its own lanes. This thread's probe lane must not reach its requests.
+        sim.local.lane = None
+    view.finish()
+    saved = {"schema": PROBE_SCHEMA, "version": VERSION, "time": time.time(), "model": args.model,
+             "base_url": args.base_url, "simulator": args.simulator, "extra_body": args.extra_body,
+             "stages": {key: state.stages[key] for key, _ in PROBE_STAGES}, "facts": state.facts}
+    if output:
+        output.write_text(json.dumps(saved, indent=2, default=str) + "\n")
+        print(f"Probe results: {output}")
+    failed = any(c["name"] == "Chat" and c["status"] == "fail" for c in state.stages["api"]["checks"])
+    return (1 if failed else 0), saved
+
+
+class QuietTest:
+    def step(self, result=""):
+        pass
+
+    def finish(self, result):
+        pass
+
+
+def probe_drift(client, saved):
+    """Tiny requests again after the benchmark, so the card can show whether the server's idle cost moved."""
+    state = ProbeState(saved["model"], saved["base_url"])
+    state.facts = saved["facts"]
+    probe = ProbeClient(client)
+    sim = clock.simulated
+    if sim:
+        sim.begin_profile(1, None)
+    probe_idle(probe, state, lambda name, total: QuietTest(), DRIFT_REQUESTS, "After benchmark", "idle_after")
+    if sim:
+        sim.local.lane = None
+    emit(client, f"Idle after the benchmark: median {seconds_label(median(state.facts['idle_after']))} to first output "
+                 f"(before: {seconds_label(median(saved['facts'].get('idle_first_output') or []))})")
+
+
+
+def simulator_clock(base_url):
+    """How a RealMark simulator at base_url keeps time: "simulated" when it answers with X-Sim-Clock, its --realtime
+    speed when it answers with X-Sim-Speed, else None."""
+    if not base_url or base_url.startswith("virtual:"):
+        return None
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/models", timeout=5) as response:
+            if response.headers.get("X-Sim-Clock"):
+                return "simulated"
+            speed = response.headers.get("X-Sim-Speed")
+            return float(speed) if speed else None
+    except (OSError, ValueError):
+        return None
+
+
+def start_simulator(arguments):
+    """Starts ripal_sim.py from beside this script with `arguments`, and returns its base URL. The server stops when
+    this process exits. Raises ValueError when it cannot start."""
+    script = Path(__file__).resolve().with_name("ripal_sim.py")
+    if not script.exists():
+        raise ValueError(f"--simulator needs {script.name} next to {Path(__file__).name}")
+    process = subprocess.Popen([sys.executable, str(script), "--port", "0", *shlex.split(arguments)],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    banner = process.stdout.readline()
+    match = re.search(r"(http://\S+/v1)", banner)
+    if not match:
+        raise ValueError(f"the simulator did not start: {process.stderr.read().strip() or 'no output'}")
+    atexit.register(process.terminate)
+    return match.group(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://localhost:8000/v1")
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--simulate", action="store_true", help="Always-correct virtual model with a discrete-event clock")
+    source.add_argument("--simulator", nargs="?", const="", metavar="ARGS",
+                        help="Run against ripal_sim.py beside this script, started with ARGS as one quoted string, "
+                             "e.g. --simulator=\"--sim-delay 2 --sim-tokenizer gpt\". See python3 ripal_sim.py --help")
     source.add_argument("--model")
     source.add_argument("--render", type=Path, help="Re-render a saved JSON datafile offline; leaves the datafile unchanged")
     source.add_argument("--resume", type=Path,
                         help="Rerun the levels a stopped run did not finish, with its saved settings, and merge them into "
                              "its results (the original is kept as NAME.before-resume.json)")
     parser.add_argument("--card-output", type=Path, help="Save the re-rendered plain-text card (requires --render)")
-    parser.add_argument("--sim-prefill", type=float, default=1000, help="Virtual model aggregate prefill tokens/s")
-    parser.add_argument("--sim-decode", type=float, default=50, help="Virtual model aggregate decode tokens/s")
-    parser.add_argument("--sim-context", type=positive, default=1048576, help="Virtual model context capacity")
-    parser.add_argument("--sim-response-timeouts", action="store_true", help="Apply response deadlines to virtual requests")
-    parser.add_argument("--sim-cache-block", type=positive, default=8192, help="Virtual model prefix-cache block size")
-    parser.add_argument("--sim-prefill-half-context", type=int, default=131072,
-                        help="Context at which a virtual request's prefill rate halves; 0 makes prefill context-free")
-    parser.add_argument("--sim-decode-half-context", type=int, default=131072,
-                        help="Context at which a virtual request's decode rate halves; 0 makes decode context-free")
-    parser.add_argument("--sim-kv-tokens", type=int, default=0,
-                        help="Virtual prefix-cache capacity shared by all lanes; least recently used lanes are "
-                             "evicted. 0 is unlimited")
+    parser.add_argument("--probe", action="store_true",
+                        help="Probe the server first, what its API supports and then its timing, and save that to "
+                             "NAME.probe.json beside the results; then run the benchmark")
+    parser.add_argument("--probe-only", action="store_true", help="Probe the server, and skip the benchmark")
     parser.add_argument("--api-key-env", default="OPENAI_API_KEY",
                         help="API key environment variable (default OPENAI_API_KEY); never saved in results")
     parser.add_argument("--lanes", nargs="+", type=positive, default=[1, 2, 4])
     parser.add_argument("--repeats", type=positive, default=1)
-    parser.add_argument("--warmup-tasks", dest="warmup_tasks", type=int, default=4,
-                        help="Unscored tasks at the start of each session (default 4; excluded from measured statistics). "
-                             "The tasks after the first carry prefill probes.")
+    parser.add_argument("--warmup-tasks", dest="warmup_tasks", type=int, default=2,
+                        help="Unscored tasks at the start of each session (default 2; excluded from measured statistics).")
     parser.add_argument("--bootstrap-samples", type=positive, default=5000)
     parser.add_argument("--ratio-tolerance", type=float, default=.15,
                         help="Relative tolerance around the 2:1 visible-word ratio, default ±15%%")
@@ -4003,26 +4862,42 @@ def main():
         except ValueError as exc:
             parser.error(str(exc))
     config = Config(**{name: getattr(args, name) for name in Config.__dataclass_fields__ if hasattr(args, name)})
-    if not all(math.isfinite(v) and v > 0 for v in (args.sim_prefill, args.sim_decode)):
-        parser.error("simulator rates must be positive and finite")
-    runtime = VirtualClock(args.sim_prefill, args.sim_decode, args.sim_response_timeouts,
-                           args.sim_prefill_half_context, args.sim_decode_half_context) if args.simulate else None
+    runtime = None
+    if args.simulator is not None:
+        try:
+            args.base_url = start_simulator(args.simulator)
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.model = "virtual-model"
+    # A simulator on simulated time says so in X-Sim-Clock. One started with --realtime runs on the wall clock, and
+    # X-Sim-Speed scales the wall clock back to simulated seconds.
+    probing = args.probe or args.probe_only
+    benchmark_ui = args.ui
+    timing = simulator_clock(args.base_url)
+    if timing:
+        runtime = SimClock(args.base_url, speed=None if timing == "simulated" else timing)
+    if timing == "simulated":
+        # Simulated time runs faster than a live view can draw. The probe's own view copes.
+        benchmark_ui = "plain"
+        if args.stage_timeout is None:
+            args.stage_timeout = 0
     with runtime if runtime else nullcontext():
-        if runtime:
-            args.model, args.base_url, args.ui = "virtual-model", "virtual://local", "plain"
-            if args.stage_timeout is None:
-                args.stage_timeout = 0
-            client = VirtualModel(runtime, TOOLS, transform, args.sim_context, args.sim_cache_block, args.sim_kv_tokens or None)
-            client.extra, client.cache_policy = args.extra_body, args.cache_policy
-        else:
-            client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),
-                            args.timeout, args.extra_body, args.cache_policy)
+        client = Client(args.base_url, args.model, os.environ.get(args.api_key_env, ""),
+                        args.timeout, args.extra_body, args.cache_policy)
+        if runtime and runtime.speed is None:
+            client.virtual_clock = runtime
         if args.output is None:
             model_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", args.model).strip(".-") or "model"
             args.output = Path(f"realmark-{model_filename}.json")
         client.timeout, client.ratio_tolerance = args.timeout, args.ratio_tolerance
         client.forced_tool_choice = args.forced_tool_choice
         client.streaming = args.streaming
+        if probing:
+            output = args.output.with_name(args.output.stem + ".probe.json") if args.probe_only else None
+            code, client.probe = run_probe(args, client, config, output)
+            if args.probe_only or code:
+                return code
+        args.ui = benchmark_ui
         control = RunControl()
         client.control = control
         with control.signals():
@@ -4108,7 +4983,7 @@ def resume_args(parser, args):
         raise ValueError(f"saved under {saved}; this script runs {VERSION} and resumes only {VERSION} runs")
     prior = report_from_telemetry(raw)
     for key, value in raw["config"]["parameters"].items():
-        if key in ("resume", "render", "card_output", "output") or not hasattr(args, key):
+        if key in ("resume", "render", "card_output", "output", "probe", "probe_only") or not hasattr(args, key):
             continue
         if key in RESUME_OVERRIDES and getattr(args, key) != parser.get_default(key):
             continue
@@ -4286,11 +5161,8 @@ def run_benchmark(args, client, config):
             emit(client, f"RIPAL-{lanes}L lane context cap {client.context_window:,} tokens "
                          f"(--max-server-context {args.max_server_context:,} / {lanes})")
         client.first_request_retries = args.first_request_retries
-        probes = probe_words(batch_config.history_words, args.warmup_tasks)
-        lanes_work = [warmup_workload(batch_config, index, args.warmup_tasks, probes) for index in range(lanes)]
-        workload = [tasks for tasks, _ in lanes_work]
-        added = max(words for _, words in lanes_work)
-        batch_config = replace(batch_config, history_words=matched_history_words(batch_config, added))
+        workload_config = replace(batch_config, tasks=args.warmup_tasks + batch_config.tasks)
+        workload = [make_session(workload_config, index) for index in range(lanes)]
         run = run_profile(client, batch_config, workload, lanes, warmup_tasks=args.warmup_tasks,
                           stage_prefill_rate=args.stage_prefill_rate, stage_timeout=args.stage_timeout)
         run["tool_timeout_seconds"] = deadline
@@ -4384,6 +5256,10 @@ def run_benchmark(args, client, config):
                                 "zero credit for copied source, invalid routing/metadata, or unfinished work",
               "scores": scores, "summaries": summaries, "geometric_mean_score": aggregate,
               "warmup_runs": warmups, "runs": runs, "skipped_levels": skipped, "history_cuts": history_cuts}
+    if getattr(client, "probe", None):
+        if not stop_requested(client):
+            probe_drift(client, client.probe)
+        report["probe"] = client.probe
     write_results(args, client, report)
     if stop_requested(client):
         return client.control.exit_code
@@ -4633,7 +5509,8 @@ def report_from_telemetry(raw):
               'config': header['workload'], 'model_context': header.get('context'),
               'requested_lanes': params.get('lanes', [1, 2, 4]), 'measurement': {
                   'warmup_tasks_per_lane': params.get('warmup_tasks', 2), 'score_work_unit_words': SCORE_WORDS},
-              'calibration': {'rounds': [], 'source': 'warmup_tasks', 'valid': False}, 'runs': [], 'warmup_runs': [], 'summaries': {}}
+              'calibration': {'rounds': [], 'source': 'warmup_tasks', 'valid': False}, 'runs': [], 'warmup_runs': [], 'summaries': {},
+              'probe': raw.get('probe')}
     stopped = next((e for e in raw.get('events', []) if e['type'] == 'run_stopped'), None)
     report.update(terminated=bool(stopped), interrupted=bool(stopped and stopped['kind'] == 'interrupt'),
                   termination_kind=stopped['kind'] if stopped else None,
