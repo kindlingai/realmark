@@ -254,3 +254,10 @@ The simulated clock moves only while every active lane waits on a request, so si
   clock go on, or `cancel` to drop its request. The client makes every decision, as it would against a real server.
 - `X-Sim-Event` on `/sim/clock` also sets the lanes of a level (`profile` with `X-Sim-Lanes`), pauses a lane while it
   does untimed work (`pause` with `X-Sim-Lane`) and resumes every lane (`resume`).
+
+
+## Agent Skill
+
+An [Agent Skill](skills/realmark/SKILL.md) is included in `skills/realmark/` so AI coding agents run RealMark consistently (default `C=1, 2, 4` concurrency sweep, `--probe` preflight, 3-run statistical rigor, buffered-stream verification, and color PNG/PDF card rendering via `skills/realmark/scripts/render_cards.py`).
+
+To install it locally for Claude Code, Codex, or compatible agents, copy `skills/realmark/` into your agent's skills directory (for example `~/.claude/skills/realmark/`).
